@@ -1,0 +1,140 @@
+# -*- coding: utf-8 -*-
+"""
+Visual check of stimulation artifact removal on a single channel (BrainVision).
+
+Compares ORIGINAL vs. PCHIP-cleaned data for one channel:
+- loads original BrainVision (.vhdr)
+- loads cleaned BrainVision (.vhdr)
+- builds epochs around Stimulus annotations
+- plots average waveform around the stimulus
+"""
+
+from pathlib import Path
+import re
+import numpy as np
+import mne
+import matplotlib.pyplot as plt
+
+
+# ================= CONFIGURATION =================
+
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")
+
+RUN = 3  # Run number to inspect
+
+CHANNEL_NAME = "SC6"   # any channel present in both files
+
+# Time window around stimulus (seconds)
+TMIN = -0.01   # -10 ms
+TMAX = 0.02    # +20 ms
+
+STIM_PREFIX = "Stimulus"   # BrainVision marker prefix
+
+# =================================================
+
+
+def get_stim_onsets_from_annotations(raw, stim_prefix="Stimulus"):
+    """Return stimulus onsets (seconds) from BrainVision annotations."""
+    events, event_id = mne.events_from_annotations(raw, verbose=False)
+
+    stim_desc = [k for k in event_id if str(k).startswith(stim_prefix)]
+    if not stim_desc:
+        return None
+
+    stim_codes = {event_id[k] for k in stim_desc}
+    stim_events = events[np.isin(events[:, 2], list(stim_codes))]
+
+    return stim_events[:, 0] / raw.info["sfreq"]
+
+
+def build_epochs(raw, onsets_s, tmin, tmax, ch_name):
+    """Create epochs around stimulus onsets for one channel."""
+    sf = raw.info["sfreq"]
+    n_times = raw.n_times
+
+    on_samp = np.round(onsets_s * sf).astype(int)
+    mask = (on_samp + int(tmin * sf) >= 0) & (on_samp + int(tmax * sf) < n_times)
+    on_samp = on_samp[mask]
+
+    if on_samp.size == 0:
+        raise RuntimeError("No valid stimulus epochs inside data range.")
+
+    events = np.column_stack([
+        on_samp,
+        np.zeros_like(on_samp),
+        np.ones_like(on_samp, dtype=int)
+    ])
+
+    epochs = mne.Epochs(
+        raw,
+        events,
+        event_id={"stim": 1},
+        tmin=tmin,
+        tmax=tmax,
+        baseline=None,
+        picks=[ch_name],
+        preload=True,
+        verbose="warning",
+    )
+    return epochs
+
+
+def main():
+
+    # ---------- Files ----------
+    vhdr_orig = SUBJECT_DIR / f"MULTICONS_2025-12-16_Run{RUN}.vhdr"
+    vhdr_clean = SUBJECT_DIR / f"MULTICONS_2025-12-16_Run{RUN}_NoStimArtifact.vhdr"
+
+    print("Original:", vhdr_orig)
+    print("Cleaned :", vhdr_clean)
+
+    if not vhdr_orig.exists():
+        raise FileNotFoundError(vhdr_orig)
+    if not vhdr_clean.exists():
+        raise FileNotFoundError(vhdr_clean)
+
+    # ---------- Load data ----------
+    raw_orig = mne.io.read_raw_brainvision(vhdr_orig, preload=True, verbose="warning")
+    raw_clean = mne.io.read_raw_brainvision(vhdr_clean, preload=True, verbose="warning")
+
+    # ---------- Channel check ----------
+    if CHANNEL_NAME not in raw_orig.ch_names:
+        raise RuntimeError(f"{CHANNEL_NAME} not found in original data.")
+    if CHANNEL_NAME not in raw_clean.ch_names:
+        raise RuntimeError(f"{CHANNEL_NAME} not found in cleaned data.")
+
+    # ---------- Stimulus onsets ----------
+    onsets = get_stim_onsets_from_annotations(raw_orig, STIM_PREFIX)
+    if onsets is None or len(onsets) == 0:
+        raise RuntimeError("No Stimulus markers found.")
+
+    print(f"Found {len(onsets)} stimuli.")
+
+    # ---------- Epochs ----------
+    ep_orig = build_epochs(raw_orig, onsets, TMIN, TMAX, CHANNEL_NAME)
+    ep_clean = build_epochs(raw_clean, onsets, TMIN, TMAX, CHANNEL_NAME)
+
+    ev_orig = ep_orig.average()
+    ev_clean = ep_clean.average()
+
+    # ---------- Data ----------
+    t_ms = ev_orig.times * 1000
+    y_orig = ev_orig.data[0] * 1e6
+    y_clean = ev_clean.data[0] * 1e6
+
+    # ---------- Plot ----------
+    plt.figure(figsize=(6, 4))
+    plt.plot(t_ms, y_orig, label="Original", lw=1)
+    plt.plot(t_ms, y_clean, label="Cleaned (NoStimArtifact)", lw=1)
+    plt.axvline(0, color="k", ls="--", label="Stimulus")
+    plt.xlabel("Time (ms)")
+    plt.ylabel("Amplitude (µV)")
+    plt.title(f"sub-P01 — Run {RUN} — {CHANNEL_NAME}")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    main()
