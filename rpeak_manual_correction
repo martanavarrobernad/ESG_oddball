@@ -1,0 +1,279 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 17 13:59:49 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 17 13:31:46 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Interactive Qt R-peak viewer/editor (batch over all runs).
+- Loads raw (original, e.g., 10 kHz), makes COPY resampled to 1 kHz for viewing/editing
+- Loads initial peaks from TSV output (from your batch script)
+- Lets user add/remove peaks manually
+- Auto-saves corrected TSV on window close, then continues to next run
+
+Controls:
+  Left / Right arrows : move window backward/forward
+  Single click        : add a peak at clicked time
+  Double click        : remove nearest peak (within REMOVE_TOL_MS)
+  Close window        : auto-save TSV and proceed to next run
+"""
+
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import mne
+
+import os
+os.environ["MPLBACKEND"] = "QtAgg"
+import matplotlib
+matplotlib.use("QtAgg", force=True)
+import matplotlib.pyplot as plt
+
+# ============================================================
+# CONFIG
+# ============================================================
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")  # <- cambia si hace falta
+SUBJECT_LABEL = "sub-P01"
+
+ECG_CHANNEL_NAME = "ECG"
+TARGET_FS = 1000.0
+
+WIN_SEC = 10.0
+STEP_SEC = 1.0
+REMOVE_TOL_MS = 150.0
+
+# Donde están tus outputs automáticos (del batch)
+IN_TSV_DIR = SUBJECT_DIR / "rpeaks_auto_1k"
+
+# Donde guardamos los corregidos manuales
+OUT_MANUAL_DIR = SUBJECT_DIR / "rpeaks_manual_1k"
+OUT_MANUAL_DIR.mkdir(exist_ok=True)
+
+# ============================================================
+# FILE DISCOVERY + READING (mismo enfoque que tu batch)
+# ============================================================
+
+def find_run_files(subject_dir: Path):
+    exts = (".edf", ".bdf", ".vhdr", ".fif")
+    files = []
+    for ext in exts:
+        files.extend(subject_dir.rglob(f"*{ext}"))
+    return sorted(files)
+
+def infer_run_number(path: Path, fallback: int) -> int:
+    name = path.name
+    m = re.search(r"(?:run[-_]?|Run[-_]?)(\d+)", name)
+    if m:
+        return int(m.group(1))
+    return fallback
+
+def read_raw_any(path: Path) -> mne.io.BaseRaw:
+    suf = path.suffix.lower()
+    if suf == ".edf":
+        return mne.io.read_raw_edf(path, preload=True, verbose="ERROR")
+    if suf == ".bdf":
+        return mne.io.read_raw_bdf(path, preload=True, verbose="ERROR")
+    if suf == ".vhdr":
+        return mne.io.read_raw_brainvision(path, preload=True, verbose="ERROR")
+    if suf == ".fif":
+        return mne.io.read_raw_fif(path, preload=True, verbose="ERROR")
+    raise RuntimeError(f"Extensión no soportada: {path}")
+
+# ============================================================
+# INTERACTIVE EDITOR
+# ============================================================
+
+class RPeakEditor:
+    def __init__(self, raw_1k, peaks_samples_1k, out_tsv_path: Path, title="R-peak Editor"):
+        self.raw = raw_1k
+        self.fs = float(raw_1k.info["sfreq"])
+        self.out_tsv_path = out_tsv_path
+
+        if ECG_CHANNEL_NAME not in raw_1k.ch_names:
+            raise RuntimeError(f"ECG channel '{ECG_CHANNEL_NAME}' not found in raw_1k.")
+
+        self.ecg = raw_1k.copy().pick_channels([ECG_CHANNEL_NAME]).get_data()[0]
+        self.n = self.ecg.size
+
+        self.win = int(WIN_SEC * self.fs)
+        self.step = int(STEP_SEC * self.fs)
+        self.remove_tol = int((REMOVE_TOL_MS / 1000.0) * self.fs)
+
+        # Peaks stored as boolean vector for easy add/remove
+        self.P = np.zeros(self.n, dtype=np.uint8)
+        peaks_samples_1k = np.asarray(peaks_samples_1k, dtype=int)
+        peaks_samples_1k = peaks_samples_1k[(peaks_samples_1k >= 0) & (peaks_samples_1k < self.n)]
+        self.P[peaks_samples_1k] = 1
+
+        self.start = 0
+
+        self.fig, self.ax = plt.subplots(figsize=(12, 5))
+        self.fig.canvas.manager.set_window_title(title)
+
+        # Plot elements
+        self.line_ecg, = self.ax.plot([], [], lw=1)
+        self.vlines = None
+
+        self.ax.set_xlabel("Time (s)")
+        self.ax.set_ylabel("ECG (a.u.)")
+        self.ax.set_title(title)
+
+        # Connect events
+        self.cid_key = self.fig.canvas.mpl_connect("key_press_event", self.on_key)
+        self.cid_click = self.fig.canvas.mpl_connect("button_press_event", self.on_click)
+        self.cid_close = self.fig.canvas.mpl_connect("close_event", self.on_close)
+
+        self.redraw()
+
+    def peaks_in_window(self, a, b):
+        idx = np.where(self.P[a:b] == 1)[0] + a
+        return idx
+
+    def redraw(self):
+        a = self.start
+        b = min(self.n, a + self.win)
+        x = np.arange(a, b) / self.fs
+        y = self.ecg[a:b]
+
+        self.line_ecg.set_data(x, y)
+
+        # Peaks vlines
+        peaks = self.peaks_in_window(a, b)
+        if self.vlines is not None:
+            self.vlines.remove()
+            self.vlines = None
+        if len(peaks) > 0:
+            xp = peaks / self.fs
+            ymin, ymax = np.min(y), np.max(y)
+            pad = 0.05 * (ymax - ymin if ymax > ymin else 1.0)
+            self.vlines = self.ax.vlines(xp, ymin - pad, ymax + pad)
+
+        self.ax.set_xlim(x[0], x[-1])
+        ymin, ymax = np.min(y), np.max(y)
+        if ymin == ymax:
+            ymin -= 1
+            ymax += 1
+        self.ax.set_ylim(ymin, ymax)
+
+        # Status text
+        total_peaks = int(self.P.sum())
+        self.ax.set_title(f"{self.fig.canvas.manager.get_window_title()} | "
+                          f"Window: {x[0]:.2f}-{x[-1]:.2f}s | Peaks total: {total_peaks}")
+
+        self.fig.canvas.draw_idle()
+
+    def on_key(self, event):
+        if event.key in ("right", "d"):
+            self.start = min(self.n - 1, self.start + self.step)
+            if self.start > self.n - self.win:
+                self.start = max(0, self.n - self.win)
+            self.redraw()
+        elif event.key in ("left", "a"):
+            self.start = max(0, self.start - self.step)
+            self.redraw()
+
+    def on_click(self, event):
+        if event.inaxes != self.ax or event.xdata is None:
+            return
+
+        idx = int(round(event.xdata * self.fs))
+        idx = int(np.clip(idx, 0, self.n - 1))
+
+        # Double click -> remove nearest peak within tolerance
+        if getattr(event, "dblclick", False):
+            peaks = np.where(self.P == 1)[0]
+            if len(peaks) == 0:
+                return
+            j = int(np.argmin(np.abs(peaks - idx)))
+            nearest = int(peaks[j])
+            if abs(nearest - idx) <= self.remove_tol:
+                self.P[nearest] = 0
+                self.redraw()
+            return
+
+        # Single click -> add peak at idx (optionally snap to local max in small neighborhood)
+        self.P[idx] = 1
+        self.redraw()
+
+    def on_close(self, event):
+        self.save()
+
+    def save(self):
+        peaks = np.where(self.P == 1)[0].astype(int)
+        times = peaks / self.fs
+
+        df = pd.DataFrame({
+            "sample_1k": peaks,
+            "time_sec": times.astype(float),
+            "proc_sfreq_hz": float(self.fs),
+        })
+        self.out_tsv_path.parent.mkdir(exist_ok=True)
+        df.to_csv(self.out_tsv_path, sep="\t", index=False)
+        print(f"[SAVED] {self.out_tsv_path} | n_peaks={len(peaks)}")
+
+# ============================================================
+# MAIN: iterate runs, open editor per run
+# ============================================================
+
+def load_initial_peaks_from_tsv(tsv_path: Path):
+    if not tsv_path.exists():
+        raise FileNotFoundError(f"No existe TSV de entrada: {tsv_path}")
+    df = pd.read_csv(tsv_path, sep="\t")
+    if "sample_1k" in df.columns:
+        return df["sample_1k"].to_numpy(dtype=int)
+    if "time_sec" in df.columns:
+        # convert to samples at 1k
+        return np.rint(df["time_sec"].to_numpy(dtype=float) * TARGET_FS).astype(int)
+    raise RuntimeError(f"TSV sin columnas esperadas (sample_1k / time_sec): {tsv_path}")
+
+def main():
+    run_files = find_run_files(SUBJECT_DIR)
+    if not run_files:
+        raise SystemExit(f"No encontré archivos raw (.edf/.bdf/.vhdr/.fif) dentro de: {SUBJECT_DIR}")
+
+    fallback_run = 1
+
+    for fpath in run_files:
+        run_num = infer_run_number(fpath, fallback_run)
+        fallback_run += 1
+
+        in_tsv = IN_TSV_DIR / f"{SUBJECT_LABEL}_Run{run_num:02d}_rpeaks.tsv"
+        out_tsv = OUT_MANUAL_DIR / f"{SUBJECT_LABEL}_Run{run_num:02d}_rpeaks_manual.tsv"
+
+        print(f"\n=== RUN {run_num:02d} ===")
+        print(f"RAW: {fpath}")
+        print(f"IN : {in_tsv}")
+        print(f"OUT: {out_tsv}")
+
+        raw = read_raw_any(fpath)
+
+        # IMPORTANT: COPY + RESAMPLE to 1 kHz (original untouched)
+        raw_1k = raw.copy().resample(TARGET_FS, npad="auto")
+
+        if ECG_CHANNEL_NAME not in raw_1k.ch_names:
+            print(f"[SKIP] No existe canal '{ECG_CHANNEL_NAME}' en este run. Canales: {raw_1k.ch_names}")
+            continue
+
+        peaks_1k = load_initial_peaks_from_tsv(in_tsv)
+
+        title = f"{SUBJECT_LABEL} | Run {run_num:02d} | ECG={ECG_CHANNEL_NAME} | {TARGET_FS:.0f} Hz"
+        editor = RPeakEditor(raw_1k, peaks_1k, out_tsv_path=out_tsv, title=title)
+
+        # BLOCK until window closed
+        plt.show()
+
+    print("\n=== FIN ===")
+    print(f"Manuales guardados en: {OUT_MANUAL_DIR}")
+
+if __name__ == "__main__":
+    main()
