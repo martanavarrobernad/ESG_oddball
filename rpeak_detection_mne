@@ -1,0 +1,194 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 17 14:03:05 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+I tried the Christov methood and MNE perfoms better, use this one
+MNE ECG R-peak detection (find_ecg_events) over all runs of a subject,
+working on a COPY resampled to 1000 Hz.
+
+Outputs:
+- rpeaks_mne/<sub>_RunXX_mne_rpeaks.tsv
+- rpeaks_mne/<sub>_mne_summary.csv
+- (optional) qc pngs
+
+Requires: mne, numpy, pandas, matplotlib (Qt not required)
+"""
+
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import mne
+
+# Optional QC plot
+import matplotlib.pyplot as plt
+
+# ============================================================
+# CONFIG
+# ============================================================
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")  # <- cambia
+SUBJECT_LABEL = "sub-P01"
+ECG_CHANNEL_NAME = "ECG"
+
+TARGET_FS = 1000.0
+FILTER_NAME_MUST_CONTAIN = "NoStimArtifact"   # pon None para no filtrar
+MAKE_QC_PNG = False
+
+OUT_DIR = SUBJECT_DIR / "rpeaks_mne"
+OUT_DIR.mkdir(exist_ok=True)
+
+# ============================================================
+# IO HELPERS
+# ============================================================
+
+def find_run_files(subject_dir: Path):
+    exts = (".edf", ".bdf", ".vhdr", ".fif")
+    files = []
+    for ext in exts:
+        files.extend(subject_dir.rglob(f"*{ext}"))
+    return sorted(files)
+
+def infer_run_number(path: Path, fallback: int) -> int:
+    name = path.name
+    m = re.search(r"(?:run[-_]?|Run[-_]?)(\d+)", name)
+    if m:
+        return int(m.group(1))
+    return fallback
+
+def read_raw_any(path: Path) -> mne.io.BaseRaw:
+    suf = path.suffix.lower()
+    if suf == ".edf":
+        return mne.io.read_raw_edf(path, preload=True, verbose="ERROR")
+    if suf == ".bdf":
+        return mne.io.read_raw_bdf(path, preload=True, verbose="ERROR")
+    if suf == ".vhdr":
+        return mne.io.read_raw_brainvision(path, preload=True, verbose="ERROR")
+    if suf == ".fif":
+        return mne.io.read_raw_fif(path, preload=True, verbose="ERROR")
+    raise RuntimeError(f"Extensión no soportada: {path}")
+
+# ============================================================
+# CORE: MNE ECG EVENTS
+# ============================================================
+
+def detect_rpeaks_mne(raw_1k: mne.io.BaseRaw, ecg_ch: str):
+    """
+    Returns:
+      peaks_idx (samples at raw_1k sfreq),
+      peaks_sec
+    """
+    if ecg_ch not in raw_1k.ch_names:
+        raise RuntimeError(f"ECG channel '{ecg_ch}' not found. Channels: {raw_1k.ch_names}")
+
+    # find_ecg_events will try to find QRS; include raw with proper ECG channel
+    events, ch_name, avg_pulse = mne.preprocessing.find_ecg_events(
+        raw_1k,
+        ch_name=ecg_ch,
+        verbose="ERROR"
+    )
+    # events[:,0] = sample index
+    peaks_idx = events[:, 0].astype(int)
+    peaks_sec = peaks_idx / float(raw_1k.info["sfreq"])
+    return peaks_idx, peaks_sec, ch_name, avg_pulse
+
+# ============================================================
+# MAIN
+# ============================================================
+
+def main():
+    files = find_run_files(SUBJECT_DIR)
+    if FILTER_NAME_MUST_CONTAIN:
+        files = [f for f in files if FILTER_NAME_MUST_CONTAIN in f.name]
+
+    if not files:
+        raise SystemExit("No encontré raws que cumplan el filtro/formatos.")
+
+    summary_rows = []
+    fallback_run = 1
+
+    for fpath in files:
+        run = infer_run_number(fpath, fallback_run)
+        fallback_run += 1
+
+        print(f"\n=== MNE ECG | Run {run:02d} ===")
+        print(f"RAW: {fpath}")
+
+        raw = read_raw_any(fpath)
+
+        # COPY + RESAMPLE to 1 kHz (original untouched)
+        raw_1k = raw.copy().resample(TARGET_FS, npad="auto")
+
+        if ECG_CHANNEL_NAME not in raw_1k.ch_names:
+            print(f"[SKIP] No existe canal '{ECG_CHANNEL_NAME}' en este run.")
+            continue
+
+        peaks_idx, peaks_sec, used_ch, avg_pulse = detect_rpeaks_mne(raw_1k, ECG_CHANNEL_NAME)
+
+        fs = float(raw_1k.info["sfreq"])
+        dur_sec = raw_1k.n_times / fs
+        n_peaks = int(len(peaks_idx))
+
+        if n_peaks >= 2:
+            rr = np.diff(peaks_sec)
+            hr = 60.0 / rr
+            mean_hr = float(np.mean(hr))
+            std_hr = float(np.std(hr))
+        else:
+            mean_hr, std_hr = np.nan, np.nan
+
+        out_tsv = OUT_DIR / f"{SUBJECT_LABEL}_Run{run:02d}_mne_rpeaks.tsv"
+        pd.DataFrame({
+            "sample_1k": peaks_idx,
+            "time_sec": peaks_sec,
+            "proc_sfreq_hz": fs,
+            "method": "mne.find_ecg_events",
+            "ecg_channel_used": used_ch,
+        }).to_csv(out_tsv, sep="\t", index=False)
+
+        print(f"  -> peaks={n_peaks} | dur={dur_sec:.1f}s | meanHR={mean_hr:.2f} bpm")
+        print(f"  -> saved: {out_tsv}")
+
+        if MAKE_QC_PNG:
+            # quick QC: 10s window near middle
+            ecg = raw_1k.copy().pick_channels([ECG_CHANNEL_NAME]).get_data()[0]
+            mid = int(0.5 * len(ecg))
+            a = max(0, mid - int(5 * fs))
+            b = min(len(ecg), mid + int(5 * fs))
+            t = np.arange(a, b) / fs
+
+            in_win = peaks_idx[(peaks_idx >= a) & (peaks_idx < b)]
+            plt.figure(figsize=(14, 4))
+            plt.plot(t, ecg[a:b], lw=1)
+            plt.scatter(in_win / fs, ecg[in_win], s=18)
+            plt.title(f"{SUBJECT_LABEL} Run {run:02d} | MNE peaks={n_peaks}")
+            plt.xlabel("Time (s)")
+            plt.ylabel("ECG")
+            qc_path = OUT_DIR / f"{SUBJECT_LABEL}_Run{run:02d}_mne_qc.png"
+            plt.savefig(qc_path, dpi=150, bbox_inches="tight")
+            plt.close()
+            print(f"  -> QC: {qc_path}")
+
+        summary_rows.append({
+            "run": run,
+            "file": str(fpath),
+            "orig_sfreq_hz": float(raw.info["sfreq"]),
+            "proc_sfreq_hz": fs,
+            "duration_sec": dur_sec,
+            "n_rpeaks": n_peaks,
+            "mean_hr_bpm": mean_hr,
+            "std_hr_bpm": std_hr,
+            "out_tsv": str(out_tsv),
+        })
+
+    summary = pd.DataFrame(summary_rows).sort_values("run")
+    out_csv = OUT_DIR / f"{SUBJECT_LABEL}_mne_summary.csv"
+    summary.to_csv(out_csv, index=False, encoding="utf-8")
+    print(f"\n=== DONE ===\nSummary: {out_csv}\nOut dir: {OUT_DIR}")
+
+if __name__ == "__main__":
+    main()
