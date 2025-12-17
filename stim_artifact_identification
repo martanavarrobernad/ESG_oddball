@@ -1,0 +1,217 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 17 11:30:54 2025
+
+@author: martanavarrobernad
+
+Interactive selection of artifact window on cervical ESG average
+from BrainVision runs (.vhdr/.eeg/.vmrk).
+"""
+
+from pathlib import Path
+import sys
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import mne
+
+# Folder that contains the runs (.vhdr/.eeg/.vmrk)
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")
+
+# Output CSV
+OUT_CSV = SUBJECT_DIR / "cfg_artifact_windows_cervical.csv"
+
+# ESG cervical channels
+ESG_CERV = [
+    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "SC6",
+]
+
+# Time window to inspect around the stimulus (in ms)
+EPOCH_VIEW_MS = (-10.0, 10.0)
+
+# Which annotations count as stimuli (BrainVision markers)
+# We'll keep all annotation descriptions that start with "Stimulus/"
+STIM_PREFIX = "Stimulus/"
+
+
+# Matplotlib backend: try a Qt backend to make ginput work interactively
+try:
+    current_backend = plt.get_backend().lower()
+    if current_backend not in ("qtagg", "qt5agg"):
+        for candidate in ("QtAgg", "Qt5Agg"):
+            try:
+                plt.switch_backend(candidate)
+                break
+            except Exception:
+                continue
+except Exception:
+    pass
+
+
+# Helpers
+def find_runs_vhdr(subject_dir: Path):
+    """Return sorted list of BrainVision header files (*.vhdr) in the folder."""
+    return sorted(subject_dir.glob("*.vhdr"))
+
+
+def stimulus_event_samples_from_annotations(raw, sfreq, stim_prefix="Stimulus/"):
+    """
+    Extract event sample indices from annotations whose description starts with stim_prefix.
+    Returns a 1D numpy array of sample indices.
+    """
+    events, event_id = mne.events_from_annotations(raw, verbose=False)
+
+    # event_id: {desc -> int_code}
+    stim_desc = [k for k in event_id.keys() if str(k).startswith(stim_prefix)]
+    if not stim_desc:
+        # Fallback: sometimes BrainVision uses "Stimulus/S  1" etc.
+        stim_desc = [k for k in event_id.keys() if str(k).startswith("Stimulus")]
+    if not stim_desc:
+        return None, event_id
+
+    stim_codes = {event_id[k] for k in stim_desc}
+    stim_events = events[np.isin(events[:, 2], list(stim_codes))]
+
+    # events[:,0] are sample indices already
+    return stim_events[:, 0].astype(int), event_id
+
+
+def build_cerv_avg_incremental_vhdr(vhdr_files, esg_names, epoch_ms=(-20.0, 20.0)):
+    """
+    Build an incremental cervical ESG average around each stimulus, across runs.
+    Returns (t_ms, avg_uv, n_trials).
+    """
+    t_ms = None
+    avg = None
+    n_trials = 0
+
+    for vhdr in vhdr_files:
+        print(f"  Loading run: {vhdr.name}")
+        raw = mne.io.read_raw_brainvision(vhdr, preload=False, verbose="warning")
+
+        # Keep only cervical channels present
+        esg_present = [ch for ch in esg_names if ch in raw.ch_names]
+        if not esg_present:
+            print("   -> No cervical ESG channels found in this run, skipping.")
+            del raw
+            continue
+
+        raw_c = raw.copy().pick(esg_present, verbose=False)
+        sf = raw_c.info["sfreq"]
+
+        # Stimulus events from annotations
+        ev_samples, event_id = stimulus_event_samples_from_annotations(raw_c, sf, STIM_PREFIX)
+        if ev_samples is None or len(ev_samples) == 0:
+            print("   -> No Stimulus annotations found in this run.")
+            print("   -> Available annotation keys (first 30):")
+            print("      ", list(event_id.keys())[:30])
+            del raw_c, raw
+            continue
+
+        s0 = int(round(epoch_ms[0] / 1000 * sf))
+        s1 = int(round(epoch_ms[1] / 1000 * sf))
+        win_len = s1 - s0 + 1
+
+        if t_ms is None:
+            t_ms = np.arange(win_len) / sf * 1000 + epoch_ms[0]
+            avg = np.zeros(win_len, dtype=float)
+
+        n_samples = raw_c.n_times
+
+        for idx in ev_samples:
+            i0 = idx + s0
+            i1 = idx + s1
+            if i0 < 0 or i1 >= n_samples:
+                continue
+
+            # Read only this segment and average across channels
+            seg = raw_c.get_data(start=i0, stop=i1 + 1)  # (n_ch, win_len)
+            seg_mean = seg.mean(axis=0) * 1e6           # to µV
+            avg += seg_mean
+            n_trials += 1
+
+        del raw_c, raw
+
+    if n_trials == 0:
+        return None, None, 0
+
+    avg /= n_trials
+    return t_ms, avg, n_trials
+
+
+def ginput_two_points_plot(t_ms, y_uv, subject_label):
+    """Interactive figure: click START and END, returns (start_ms, end_ms)."""
+    plt.ion()
+    fig, ax = plt.subplots(figsize=(8, 3))
+    ax.plot(t_ms, y_uv, lw=1)
+    ax.axvline(0, color="r", ls="--", label="stimulus")
+    ax.set_title(f"{subject_label} — click START and END of artifact (ms)")
+    ax.set_xlabel("Time (ms)")
+    ax.set_ylabel("Amplitude (µV)")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    fig.show()
+
+    try:
+        pts = plt.ginput(2, timeout=-1)
+    except Exception:
+        pts = plt.ginput(2, timeout=0)
+
+    plt.close(fig)
+
+    if not pts or len(pts) < 2:
+        return None, None
+
+    xs = sorted(p[0] for p in pts)
+    return xs[0], xs[1]
+
+
+# Main
+def main():
+    if not SUBJECT_DIR.exists():
+        print(f"Folder does not exist:\n{SUBJECT_DIR}")
+        sys.exit(1)
+
+    vhdr_files = find_runs_vhdr(SUBJECT_DIR)
+    if not vhdr_files:
+        print(f"No .vhdr files found in:\n{SUBJECT_DIR}")
+        sys.exit(1)
+
+    print(f"Found {len(vhdr_files)} runs:")
+    for f in vhdr_files:
+        print(" -", f.name)
+
+    print("\nBuilding cervical ESG average (RAM-friendly)...")
+    t_ms, y_uv, n_trials = build_cerv_avg_incremental_vhdr(
+        vhdr_files, ESG_CERV, EPOCH_VIEW_MS
+    )
+
+    if t_ms is None:
+        print("\nNo valid stimuli/cervical ESG found across runs. Nothing to do.")
+        sys.exit(1)
+
+    print(f"\n{n_trials} stimuli included in the average.")
+
+    start_ms, end_ms = ginput_two_points_plot(t_ms, y_uv, subject_label="sub-P01")
+    if start_ms is None:
+        print("No window selected -> exiting.")
+        sys.exit(0)
+
+    print(f"Selected window: {start_ms:.2f} – {end_ms:.2f} ms")
+
+    df = pd.DataFrame([{
+        "subject": "sub-P01",
+        "start_cerv_ms": start_ms,
+        "end_cerv_ms": end_ms,
+    }])
+
+    OUT_CSV.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(OUT_CSV, index=False, float_format="%.6f", encoding="utf-8")
+    print("\nArtifact window saved to:", OUT_CSV)
+    print(df)
+
+
+if __name__ == "__main__":
+    main()
