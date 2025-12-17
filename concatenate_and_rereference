@@ -1,0 +1,96 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 17 15:56:25 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Concatenate cleaned ESG runs (1 kHz) and save:
+  1) concatenated file with original reference (TH6)
+  2) concatenated file re-referenced to AC
+
+Nothing is overwritten.
+"""
+
+from pathlib import Path
+import mne
+
+# ============================================================
+# CONFIG
+# ============================================================
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")
+SUBJECT_LABEL = "sub-P01"
+
+CLEAN_DIR = SUBJECT_DIR / "esg_pcaobs_clean_1k"
+
+# output
+OUT_DIR = SUBJECT_DIR / "esg_concat"
+OUT_DIR.mkdir(exist_ok=True)
+
+# reference channels
+ORIGINAL_REF = "TH6"
+NEW_REF = "AC"
+
+# ============================================================
+# LOAD ALL CLEAN RUNS
+# ============================================================
+fifs = sorted(CLEAN_DIR.glob(f"{SUBJECT_LABEL}_Run*_resamp1k_PCAOBS_clean_raw.fif"))
+
+if not fifs:
+    raise RuntimeError(f"No cleaned FIF files found in {CLEAN_DIR}")
+
+print("Found runs:")
+for f in fifs:
+    print(" ", f.name)
+
+raws = []
+for f in fifs:
+    raw = mne.io.read_raw_fif(f, preload=True, verbose="ERROR")
+    raws.append(raw)
+
+# ============================================================
+# SAFETY CHECKS
+# ============================================================
+sfreqs = {raw.info["sfreq"] for raw in raws}
+if len(sfreqs) != 1:
+    raise RuntimeError(f"Different sampling rates found: {sfreqs}")
+
+ch_names_ref = raws[0].ch_names
+for i, raw in enumerate(raws[1:], start=2):
+    if raw.ch_names != ch_names_ref:
+        raise RuntimeError(f"Channel mismatch in run {i}")
+
+print(f"[OK] {len(raws)} runs | sfreq = {sfreqs.pop()} Hz")
+
+# ============================================================
+# CONCATENATE (ORIGINAL REFERENCE)
+# ============================================================
+print("\nConcatenating runs (original reference)...")
+raw_concat = mne.concatenate_raws(raws, preload=True)
+
+# OPTIONAL: explicitly set original reference (usually already applied)
+if ORIGINAL_REF in raw_concat.ch_names:
+    raw_concat.set_eeg_reference(ref_channels=[ORIGINAL_REF], verbose="ERROR")
+
+out_orig = OUT_DIR / f"{SUBJECT_LABEL}_concat_ref-{ORIGINAL_REF}_1k_raw.fif"
+raw_concat.save(out_orig, overwrite=False)
+print(f"[SAVED] {out_orig}")
+
+# ============================================================
+# COPY + RE-REFERENCE TO AC
+# ============================================================
+print("\nRe-referencing concatenated data to AC...")
+raw_concat_ac = raw_concat.copy()
+
+if NEW_REF not in raw_concat_ac.ch_names:
+    raise RuntimeError(f"Reference channel '{NEW_REF}' not found")
+
+raw_concat_ac.set_eeg_reference(ref_channels=[NEW_REF], verbose="ERROR")
+
+out_ac = OUT_DIR / f"{SUBJECT_LABEL}_concat_ref-{NEW_REF}_1k_raw.fif"
+raw_concat_ac.save(out_ac, overwrite=False)
+print(f"[SAVED] {out_ac}")
+
+print("\nDONE.")
