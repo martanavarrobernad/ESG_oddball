@@ -1,0 +1,53 @@
+"""
+Interactive inspection of cervical ESG channels from a RAW EEG/ESG file.
+Works with .fif, .set (EEGLAB) and BrainVision (.vhdr/.eeg/.vmrk)
+"""
+
+from pathlib import Path
+import mne
+
+# === List of cervical ESG channels ===
+ESG_CERV = [
+    "Iz", "SC1", "SC6", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "AC", "TH6"
+]
+
+# ================= CONFIGURATION (edit this) =================
+# for BrainVision, point to the .vhdr file
+RAW_FILE = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01\MULTICONS_2025-12-16_Run1.vhdr")
+
+# ================= 1) LOAD WITHOUT PRELOAD ==================
+print(f"Loading: {RAW_FILE}")
+
+suffix = RAW_FILE.suffix.lower()
+if suffix == ".fif":
+    raw = mne.io.read_raw_fif(RAW_FILE, preload=False, verbose="warning")
+elif suffix == ".set":
+    raw = mne.io.read_raw_eeglab(RAW_FILE, preload=False, verbose="warning")
+elif suffix == ".vhdr":
+    raw = mne.io.read_raw_brainvision(RAW_FILE, preload=False, verbose="warning")
+else:
+    raise ValueError(f"Unsupported file extension: {suffix}")
+
+print(raw)  # summary: n_channels, sfreq, etc.
+
+# ================= 2) SELECT CHANNELS TO DISPLAY ==================
+picks_esg = [ch for ch in ESG_CERV if ch in raw.ch_names]
+
+print(f"\nDisplaying {len(picks_esg)} ESG channels:")
+print(picks_esg)
+
+if len(picks_esg) == 0:
+    print("\nWARNING: None of the ESG_CERV channel names were found in raw.ch_names.")
+    print("Available channels (first 50):")
+    print(raw.ch_names[:50])
+
+# ================= 3) INTERACTIVE PLOT ==================
+raw.plot(
+    picks=picks_esg if len(picks_esg) > 0 else None,  # if none found, show all
+    duration=4.0,
+    start=0.0,
+    n_channels=min(max(len(picks_esg), 1), 20),
+    block=True
+)
