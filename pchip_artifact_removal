@@ -1,0 +1,211 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 17 11:49:04 2025
+
+author: @martanavarrobernad
+
+Stimulation artifact removal (PCHIP) on all analog channels (EEG, ESG, ECG, ENG, etc.)
+for BrainVision runs (.vhdr/.eeg/.vmrk).
+
+Pipeline:
+1) Read artifact window from cfg_artifact_windows_cervical.csv (start_ms/end_ms).
+2) Load each BrainVision run (*.vhdr) in SUBJECT_DIR.
+3) Detect stimuli from annotations whose description starts with "Stimulus/" (or "Stimulus").
+4) Interpolate [start_ms, end_ms] around each stimulus on all channels except stim/misc.
+5) Export one BrainVision set per run:
+   "MULTICONS_2025-12-16_RunX_NoStimArtifact.eeg" (+ .vhdr + .vmrk)
+"""
+
+from pathlib import Path
+import re
+
+import numpy as np
+import pandas as pd
+import mne
+from scipy.interpolate import PchipInterpolator
+
+
+# ==== 1) PATHS / CONFIG ====
+
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")
+CFG_WIN_CSV = SUBJECT_DIR / "cfg_artifact_windows_cervical.csv"
+
+# We will look for runs like: MULTICONS_2025-12-16_Run1.vhdr, Run2.vhdr, ...
+RUN_GLOB = "MULTICONS_*_Run*.vhdr"
+
+# Stimulus markers
+STIM_PREFIX = "Stimulus/"  # primary
+# fallback: anything starting with "Stimulus"
+
+# PCHIP padding samples around the gap
+N_PAD = 5
+
+
+# ==== 2) HELPERS ====
+
+def find_runs_vhdr(subject_dir: Path):
+    return sorted(subject_dir.glob(RUN_GLOB))
+
+
+def get_stim_onsets_from_annotations(raw: mne.io.BaseRaw, stim_prefix: str = "Stimulus/"):
+    """
+    Return onsets (in seconds) of all annotations whose description matches Stimulus markers.
+    """
+    # events[:,0] are sample indices; raw.times gives seconds but we’ll compute seconds directly
+    events, event_id = mne.events_from_annotations(raw, verbose=False)
+
+    stim_desc = [k for k in event_id.keys() if str(k).startswith(stim_prefix)]
+    if not stim_desc:
+        stim_desc = [k for k in event_id.keys() if str(k).startswith("Stimulus")]
+
+    if not stim_desc:
+        return None, event_id
+
+    stim_codes = {event_id[k] for k in stim_desc}
+    stim_events = events[np.isin(events[:, 2], list(stim_codes))]
+
+    # convert sample index to seconds
+    onsets_sec = stim_events[:, 0] / raw.info["sfreq"]
+    return onsets_sec.astype(float), event_id
+
+
+def interpolate_stim_artifact(raw, onsets_sec, start_ms, end_ms, picks, n_pad=5):
+    """
+    Interpolate the stimulation artifact using PCHIP for selected channels.
+    """
+    if not picks:
+        return
+
+    sf = raw.info["sfreq"]
+    data = raw._data  # (n_ch, n_times)
+
+    ch_indices = [raw.ch_names.index(ch) for ch in picks if ch in raw.ch_names]
+    if len(ch_indices) == 0:
+        return
+
+    s0 = int(round(start_ms / 1000 * sf))
+    s1 = int(round(end_ms / 1000 * sf))
+    n_times = data.shape[1]
+
+    for ons in onsets_sec:
+        idx_stim = int(round(ons * sf))
+        i0 = idx_stim + s0
+        i1 = idx_stim + s1
+
+        if i0 <= 0 or i1 >= n_times - 1:
+            continue
+
+        before = np.arange(i0 - n_pad, i0)
+        after = np.arange(i1 + 1, i1 + 1 + n_pad)
+        x_known = np.concatenate([before, after])
+
+        if x_known.min() < 0 or x_known.max() >= n_times:
+            continue
+
+        x_interp = np.arange(i0, i1 + 1)
+
+        for ch in ch_indices:
+            y_known = data[ch, x_known]
+
+            if np.allclose(y_known, y_known[0]):
+                data[ch, i0:i1 + 1] = y_known.mean()
+            else:
+                f = PchipInterpolator(x_known, y_known)
+                data[ch, i0:i1 + 1] = f(x_interp)
+
+
+# ==== 3) MAIN ====
+
+def main():
+    if not SUBJECT_DIR.exists():
+        print("Folder does not exist:", SUBJECT_DIR)
+        return
+
+    if not CFG_WIN_CSV.exists():
+        print("Artifact-window CSV not found:", CFG_WIN_CSV)
+        return
+
+    cfg = pd.read_csv(CFG_WIN_CSV)
+
+    # Accept either "subject" as "sub-P01" or numeric; we just take the first row
+    row0 = cfg.iloc[0]
+    start_ms = float(row0["start_cerv_ms"])
+    end_ms = float(row0["end_cerv_ms"])
+
+    print(f"Artifact window: {start_ms:.3f} ms → {end_ms:.3f} ms")
+
+    vhdr_files = find_runs_vhdr(SUBJECT_DIR)
+    if not vhdr_files:
+        print("No .vhdr runs found with pattern:", RUN_GLOB)
+        return
+
+    print(f"Found {len(vhdr_files)} runs.")
+    for f in vhdr_files:
+        print(" -", f.name)
+
+    for vhdr in vhdr_files:
+        print(f"\n===== RUN: {vhdr.name} =====")
+
+        raw = mne.io.read_raw_brainvision(vhdr, preload=False, verbose="warning")
+
+        # Get stimulus onsets from annotations
+        onsets = None
+        onsets, event_id = get_stim_onsets_from_annotations(raw, STIM_PREFIX)
+        if onsets is None or len(onsets) == 0:
+            print("No Stimulus markers found. Available annotation keys (first 30):")
+            print(list(event_id.keys())[:30])
+            del raw
+            continue
+
+        # Load to memory for editing and reduce RAM
+        raw.load_data()
+        raw._data = raw._data.astype(np.float32)
+
+        # Channel selection: clean all except stim/misc (if types exist).
+        ch_types = raw.get_channel_types()
+        ch_to_clean = [ch for ch, t in zip(raw.ch_names, ch_types) if t not in ("stim", "misc")]
+
+        # Fallback: if everything came as misc/unknown (rare), just avoid channels named like STI/trigger
+        if len(ch_to_clean) == 0:
+            ch_to_clean = [ch for ch in raw.ch_names if not re.search(r"(stim|sti|trigger)", ch, re.I)]
+
+        print(f"Total channels: {len(raw.ch_names)} | sfreq = {raw.info['sfreq']} Hz")
+        print(f"Channels to clean: {len(ch_to_clean)}")
+        print(f"Number of stimuli: {len(onsets)}")
+
+        interpolate_stim_artifact(
+            raw,
+            onsets_sec=onsets,
+            start_ms=start_ms,
+            end_ms=end_ms,
+            picks=ch_to_clean,
+            n_pad=N_PAD,
+        )
+
+        # Build output name:
+        # MULTICONS_2025-12-16_RunX_NoStimArtifact.eeg (plus .vhdr/.vmrk)
+        m = re.search(r"_Run(\d+)\.vhdr$", vhdr.name, flags=re.I)
+        run_id = int(m.group(1)) if m else 1
+
+        # Use the same date prefix as your original file name if possible:
+        # Example input: MULTICONS_2025-12-16_Run1.vhdr -> base_prefix = MULTICONS_2025-12-16
+        base_prefix = re.sub(r"_Run\d+\.vhdr$", "", vhdr.name, flags=re.I)
+
+        out_base = SUBJECT_DIR / f"{base_prefix}_Run{run_id}_NoStimArtifact"
+        out_vhdr = out_base.with_suffix(".vhdr")  # export creates .eeg/.vmrk too
+
+        # Export to BrainVision
+        # (This writes .vhdr + .vmrk + .eeg)
+        mne.export.export_raw(out_vhdr, raw, fmt="brainvision", overwrite=True)
+
+        print("Saved BrainVision files with base name:")
+        print(" ", out_base)
+        print(" (creates .vhdr + .vmrk + .eeg)")
+
+        del raw
+
+    print("\nFinished: stimulation artifact interpolated for all non-stim channels.")
+
+
+if __name__ == "__main__":
+    main()
