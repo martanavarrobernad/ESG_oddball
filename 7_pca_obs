@@ -1,0 +1,159 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 17 15:07:47 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Use MNE built-in PCA-OBS: mne.preprocessing.apply_pca_obs
+
+Pipeline per run:
+1) Read BrainVision .vhdr (original, e.g., 10 kHz)
+2) COPY + resample ALL channels to 1000 Hz
+3) Load manual R-peaks TSV (samples at 1000 Hz)
+4) Convert peaks to qrs_times (seconds)
+5) Apply mne.preprocessing.apply_pca_obs to ESG channels only
+6) Save cleaned/resampled raw to FIF
+
+Requires: MNE >= 1.10 (apply_pca_obs was added in v1.10)
+"""
+
+from pathlib import Path
+import re
+import numpy as np
+import pandas as pd
+import mne
+
+# =========================
+# CONFIG
+# =========================
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")
+SUBJECT_LABEL = "sub-P01"
+
+# Only process original 10kHz runs whose filename contains:
+RAW_NAME_MUST_CONTAIN = "NoStimArtifact"
+RAW_EXT = ".vhdr"
+
+# Manual peaks (at 1 kHz)
+RPEAKS_DIR = SUBJECT_DIR / "rpeaks_manual"  # cambia si es "rpeaks_manual"
+RPEAKS_TSV_GLOB = f"{SUBJECT_LABEL}_Run*_rpeaks_manual.tsv"
+
+TARGET_FS = 1000.0
+N_COMPONENTS = 4  # OBS = mean + first 4 PCA comps (per MNE doc)
+
+OUT_DIR = SUBJECT_DIR / "esg_pcaobs_clean_1k"
+OUT_DIR.mkdir(exist_ok=True)
+
+ESG_CERV = [
+    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "SC6", "AC", "TH6"
+]
+
+# =========================
+# HELPERS
+# =========================
+def parse_run_number(name: str):
+    m = re.search(r"(?:run[-_]?|Run[-_]?)(\d+)", name)
+    return int(m.group(1)) if m else None
+
+def find_vhdrs(subject_dir: Path):
+    files = sorted(subject_dir.rglob(f"*{RAW_EXT}"))
+    if RAW_NAME_MUST_CONTAIN:
+        files = [f for f in files if RAW_NAME_MUST_CONTAIN in f.name]
+    return files
+
+def load_manual_peaks_1k(tsv_path: Path) -> np.ndarray:
+    df = pd.read_csv(tsv_path, sep="\t")
+    if "sample_1k" in df.columns:
+        return df["sample_1k"].to_numpy(dtype=np.int64)
+    if "time_sec" in df.columns:
+        return np.rint(df["time_sec"].to_numpy(dtype=float) * TARGET_FS).astype(np.int64)
+    raise RuntimeError(f"TSV sin 'sample_1k' ni 'time_sec': {tsv_path}")
+
+# =========================
+# MAIN
+# =========================
+def main():
+    # Ensure function exists (MNE >= 1.10)
+    if not hasattr(mne.preprocessing, "apply_pca_obs"):
+        raise RuntimeError(
+            "Tu MNE no tiene mne.preprocessing.apply_pca_obs. "
+            "Actualiza a MNE >= 1.10."
+        )
+
+    # Map run -> vhdr
+    run_to_raw = {}
+    for vhdr in find_vhdrs(SUBJECT_DIR):
+        r = parse_run_number(vhdr.name)
+        if r is not None and r not in run_to_raw:
+            run_to_raw[r] = vhdr
+
+    if not run_to_raw:
+        raise SystemExit(f"No encontré .vhdr con '{RAW_NAME_MUST_CONTAIN}' en {SUBJECT_DIR}")
+
+    # Process TSVs (truth)
+    tsvs = sorted(RPEAKS_DIR.glob(RPEAKS_TSV_GLOB))
+    if not tsvs:
+        raise SystemExit(f"No TSVs en {RPEAKS_DIR} con patrón {RPEAKS_TSV_GLOB}")
+
+    for tsv in tsvs:
+        run = parse_run_number(tsv.name)
+        if run is None or run not in run_to_raw:
+            print(f"[SKIP] {tsv.name} (no encuentro raw NoStimArtifact para ese run)")
+            continue
+
+        raw_path = run_to_raw[run]
+        print("\n====================================================")
+        print(f"RUN {run:02d}")
+        print(f"RAW: {raw_path}")
+        print(f"TSV: {tsv}")
+
+        # 1) Read raw (10kHz)
+        raw = mne.io.read_raw_brainvision(raw_path, preload=True, verbose="ERROR")
+
+        # 2) COPY + resample ALL channels to 1k
+        raw_1k = raw.copy().resample(TARGET_FS, npad="auto")
+        fs = float(raw_1k.info["sfreq"])
+
+        # 3) Load peaks @ 1k samples
+        peaks = load_manual_peaks_1k(tsv)
+        peaks = np.unique(peaks[(peaks >= 0) & (peaks < raw_1k.n_times)])
+
+        if len(peaks) < 5:
+            print(f"[SKIP] Muy pocos picos ({len(peaks)})")
+            continue
+
+        # 4) qrs_times in seconds (MNE expects seconds) :contentReference[oaicite:1]{index=1}
+        qrs_times = peaks / fs
+
+        # 5) Picks = ESG channels that exist in raw_1k
+        picks = [ch for ch in ESG_CERV if ch in raw_1k.ch_names]
+        if not picks:
+            print("[SKIP] Ningún canal ESG_CERV está en este raw.")
+            continue
+
+        print(f"[INFO] sfreq={fs:.0f} Hz | peaks={len(peaks)} | picks(ESG)={len(picks)}")
+
+        # Apply PCA-OBS ONLY to ESG channels (others untouched)
+        # copy=False -> modify raw_1k in-place
+        raw_1k = mne.preprocessing.apply_pca_obs(
+            raw_1k,
+            picks=picks,
+            qrs_times=qrs_times,
+            n_components=N_COMPONENTS,
+            copy=False,
+            verbose=True,
+        )
+
+        # 6) Save
+        out_fif = OUT_DIR / f"{SUBJECT_LABEL}_Run{run:02d}_resamp1k_PCAOBS_clean_raw.fif"
+        raw_1k.save(out_fif, overwrite=True)
+        print(f"[SAVED] {out_fif}")
+
+    print(f"\nDONE. Outputs in: {OUT_DIR}")
+
+if __name__ == "__main__":
+    main()
