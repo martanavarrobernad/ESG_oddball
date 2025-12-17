@@ -1,0 +1,128 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Wed Dec 17 15:23:38 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Interactive MNE Raw viewer with interleaved channels:
+  CH_NOW (cleaned, 1kHz) in black
+  CH_BEFORE (original, 10kHz) in pink
+
+Uses mne.io.Raw.plot() for standard EEG-like browsing (scroll/scale/zoom).
+
+IMPORTANT:
+- BEFORE is BrainVision (.vhdr) at 10kHz -> we resample a COPY to 1000 Hz
+  so that both signals share the same time axis and can be interleaved.
+- NOW is your cleaned .fif already at 1000 Hz.
+"""
+
+from pathlib import Path
+import numpy as np
+import mne
+
+# ================= CONFIG =================
+ESG_CERV = [
+    "Iz", "SC1", "SC6", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "AC", "TH6"
+]
+
+# BEFORE (original 10kHz)
+BEFORE_VHDR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01\MULTICONS_2025-12-16_Run1.vhdr")
+
+# NOW (cleaned 1kHz)
+NOW_FIF = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01\esg_pcaobs_clean_1k\sub-P01_Run01_resamp1k_PCAOBS_clean_raw.fif")
+
+TARGET_FS = 1000.0  # match the cleaned file
+DURATION = 4.0
+N_CHAN_SHOW = 20
+
+# ================= LOAD =================
+print(f"Loading BEFORE: {BEFORE_VHDR}")
+raw_before = mne.io.read_raw_brainvision(BEFORE_VHDR, preload=False, verbose="warning")
+
+print(f"Loading NOW: {NOW_FIF}")
+raw_now = mne.io.read_raw_fif(NOW_FIF, preload=False, verbose="warning")
+
+# ---------- Make both same sfreq ----------
+# We resample BEFORE to 1000 Hz on a COPY (so original untouched)
+print(f"Resampling BEFORE to {TARGET_FS} Hz (copy)...")
+raw_before_1k = raw_before.copy().load_data().resample(TARGET_FS, npad="auto")
+
+# Ensure NOW is also 1k (should be)
+raw_now_1k = raw_now.copy()
+if abs(raw_now_1k.info["sfreq"] - TARGET_FS) > 1e-6:
+    print(f"[WARN] NOW sfreq is {raw_now_1k.info['sfreq']}, resampling to {TARGET_FS}")
+    raw_now_1k = raw_now_1k.copy().load_data().resample(TARGET_FS, npad="auto")
+else:
+    raw_now_1k.load_data()
+
+# ---------- Choose channels that exist in BOTH ----------
+chs = [ch for ch in ESG_CERV if (ch in raw_before_1k.ch_names and ch in raw_now_1k.ch_names)]
+if not chs:
+    raise RuntimeError("None of ESG_CERV channels found in BOTH BEFORE and NOW files.")
+
+print(f"Interleaving {len(chs)} ESG channels:")
+print(chs)
+
+# ---------- Crop both to common duration ----------
+dur_before = raw_before_1k.n_times / raw_before_1k.info["sfreq"]
+dur_now = raw_now_1k.n_times / raw_now_1k.info["sfreq"]
+dur = min(dur_before, dur_now)
+raw_before_1k.crop(tmin=0, tmax=dur, include_tmax=False)
+raw_now_1k.crop(tmin=0, tmax=dur, include_tmax=False)
+
+# ---------- Build interleaved RawArray ----------
+sfreq = TARGET_FS
+data_rows = []
+names = []
+types = []
+
+for ch in chs:
+    x_now = raw_now_1k.get_data(picks=[ch])[0]
+    x_bef = raw_before_1k.get_data(picks=[ch])[0]
+
+    # Interleaved order: NOW then BEFORE
+    data_rows.append(x_now)
+    names.append(f"{ch}_NOW")
+    types.append("misc")
+
+    data_rows.append(x_bef)
+    names.append(f"{ch}_BEFORE")
+    types.append("misc")
+
+data = np.vstack(data_rows)
+
+info = mne.create_info(ch_names=names, sfreq=sfreq, ch_types=types)
+raw_combo = mne.io.RawArray(data, info, verbose="ERROR")
+ann0 = raw_now_1k.annotations
+
+ann = mne.Annotations(
+    onset=ann0.onset.copy(),
+    duration=ann0.duration.copy(),
+    description=ann0.description.copy(),
+    orig_time=None,              
+)
+
+raw_combo.set_annotations(ann)
+
+
+# ---------- Styling: set colors so it looks like you want ----------
+# MNE Raw.plot accepts scalings and can accept colors dict in newer MNE,
+# but robust way: keep names with suffix and rely on default colors.
+# We'll set a standard high-pass for viewing if you want (optional):
+# raw_combo.filter(l_freq=0.5, h_freq=None)
+
+print(raw_combo)
+
+# ================= PLOT (EEG-like viewer) =================
+# You can change scale interactively inside the viewer (same as usual MNE).
+raw_combo.plot(
+    duration=DURATION,
+    start=0.0,
+    n_channels=min(len(names), N_CHAN_SHOW),
+    block=True
+)
