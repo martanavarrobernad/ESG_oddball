@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
 """
+Created on Thu Dec 18 12:29:37 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
 Created on Thu Dec 18 11:21:18 2025
 
 @author: navar
@@ -11,12 +18,10 @@ Filtering of concatenated files (1 kHz) with different band-pass per reference
 + PSD computation for QC.
 
 TH6 ref:
-  - Notch: 48–53 Hz
-  - Band-pass: 5–400 Hz
+  - Band-pass: 0.1–40 Hz
 
 AC ref:
-  - Notch: 48–53 Hz
-  - Band-pass: 30–400 Hz
+  - Band-pass: 0.1–40 Hz
 
 Also computes and saves PSD plots (Welch).
 """
@@ -49,25 +54,14 @@ ESG_CERV = [
     "SC6", "AC", "TH6"
 ]
 
-# Notch specs
-NOTCH_LO = 48.0
-NOTCH_HI = 53.0
-NOTCH_CENTER = (NOTCH_LO + NOTCH_HI) / 2.0
-NOTCH_WIDTH = (NOTCH_HI - NOTCH_LO)
-
 # Band-pass per ref
 BANDPASS = {
-    "TH6": (5.0, 400.0),
-    "AC":  (30.0, 400.0),
+    "TH6": (0.5, 20.0),
+    "AC":  (0.5, 20.0),
 }
 
 # IIR butterworth (4th order), zero-phase
 IIR_PARAMS = dict(order=4, ftype="butter")
-
-# PSD params
-PSD_FMIN = 1.0
-PSD_FMAX = 500.0
-PSD_NFFT = 4096
 
 # ============================================================
 # RUN
@@ -82,24 +76,11 @@ for ref, in_fif in FILES.items():
     print("\n==============================================")
     print(f"Reference: {ref}")
     print(f"Input: {in_fif.name}")
-    print(f"Notch: {NOTCH_LO}-{NOTCH_HI} Hz | Band-pass: {l_freq}-{h_freq} Hz")
 
     raw = mne.io.read_raw_fif(in_fif, preload=True, verbose="ERROR")
 
     # Pick ESG channels for PSD
     esg_chs = [ch for ch in ESG_CERV if ch in raw.ch_names]
-
-    # -------------------
-    # 1) Notch
-    # -------------------
-    raw.notch_filter(
-        freqs=[NOTCH_CENTER],
-        notch_widths=NOTCH_WIDTH,
-        method="iir",
-        iir_params=IIR_PARAMS,
-        phase="zero",
-        verbose="ERROR",
-    )
 
     # -------------------
     # 2) Band-pass
