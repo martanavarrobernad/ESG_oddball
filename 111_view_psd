@@ -1,0 +1,173 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec 18 11:36:12 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+ESG — Inspección visual de canales ruidosos mediante PSD interactivo.
+Clic para marcar canales malos (toggle).
+
+Entrada: 2 archivos concatenados YA FILTRADOS (ref-TH6 y ref-AC)
+Salida: bad_esg_channels_from_psd_clicks_concat.csv
+
+Funcionamiento:
+  - Abre una figura con la PSD (solo canales ESG de la lista)
+  - Haz clic en las curvas que quieras marcar como malas
+  - Cada clic alterna entre "bueno" y "malo"
+  - Cierra la ventana → guarda resultado
+"""
+
+from pathlib import Path
+import csv
+import re
+
+import numpy as np
+import matplotlib.pyplot as plt
+import mne
+
+# ============================================================
+# CONFIG
+# ============================================================
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")
+
+IN_DIR = SUBJECT_DIR / "esg_concat_filt"   # aquí están tus concatenados filtrados
+OUT_DIR = SUBJECT_DIR / "esg_concat_qc"
+OUT_DIR.mkdir(exist_ok=True)
+
+OUTPUT_CSV = OUT_DIR / "bad_esg_channels_from_psd_clicks_concat.csv"
+
+FILES = [
+    IN_DIR / "sub-P01_concat_ref-TH6_1k_notch48-53_bp5-400_raw.fif",
+    IN_DIR / "sub-P01_concat_ref-AC_1k_notch48-53_bp30-400_raw.fif",
+]
+
+ESG_CHANNELS = [
+    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "SC6", "AC", "TH6"
+]
+
+# PSD params (ajusta a gusto)
+FMIN = 5.0
+FMAX = 400.0
+N_FFT = 4096
+
+# ============================================================
+# INTERACTIVE PSD
+# ============================================================
+def interactive_psd_bad_selection(raw, picks, title, fmin=FMIN, fmax=FMAX):
+    plt.ioff()
+
+    psd = raw.compute_psd(
+        picks=picks,
+        fmin=fmin,
+        fmax=fmax,
+        method="welch",
+        n_fft=N_FFT,
+        verbose="ERROR",
+    )
+
+    psds, freqs = psd.get_data(return_freqs=True)  # V²/Hz
+
+    # Convert to µV²/Hz for typical-looking PSD
+    psds_uV2 = psds * 1e12
+
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.set_title(title)
+    ax.set_xlabel("Frecuencia (Hz)")
+    ax.set_ylabel("Potencia (µV²/Hz)")
+    ax.set_xscale("log")
+    ax.set_xlim((fmin, fmax))
+
+    lines = []
+    bad_channels = set()
+
+    for ch_idx, ch_name in enumerate(psd.ch_names):
+        line, = ax.plot(
+            freqs,
+            psds_uV2[ch_idx],
+            label=ch_name,
+            picker=True,
+            pickradius=5,
+        )
+        lines.append(line)
+
+    ax.legend(loc="best", fontsize="small", ncol=2)
+
+    def toggle_bad(line):
+        ch_name = line.get_label()
+        if ch_name in bad_channels:
+            bad_channels.remove(ch_name)
+            line.set_linewidth(1.0)
+            line.set_alpha(1.0)
+        else:
+            bad_channels.add(ch_name)
+            line.set_linewidth(3.0)
+            line.set_alpha(0.3)
+
+    def on_pick(event):
+        line = event.artist
+        toggle_bad(line)
+        fig.canvas.draw_idle()
+
+    fig.canvas.mpl_connect("pick_event", on_pick)
+
+    print("   → Clic en las curvas para marcar canales malos.")
+    print("     Cierra la ventana cuando termines.")
+
+    plt.show(block=True)
+    plt.close(fig)
+
+    return sorted(bad_channels)
+
+# ============================================================
+# PIPELINE
+# ============================================================
+def esg_psd_click_inspection():
+    rows = []
+
+    for fif in FILES:
+        if not fif.exists():
+            print(f"[SKIP] Not found: {fif}")
+            continue
+
+        print(f"\nLoading {fif.name}")
+        raw = mne.io.read_raw_fif(fif, preload=True, verbose="warning")
+
+        esg_ch = [ch for ch in ESG_CHANNELS if ch in raw.ch_names]
+        if not esg_ch:
+            print("   ⚠ No ESG channels from list in this file.")
+            continue
+
+        # detectar ref desde nombre
+        ref = "UNKNOWN"
+        mref = re.search(r"ref-([A-Za-z0-9]+)", fif.name)
+        if mref:
+            ref = mref.group(1)
+
+        title = f"PSD ESG (clic para marcar malos) | {fif.name}"
+
+        print("   → Mostrando PSD...")
+        bad_ch = interactive_psd_bad_selection(raw, esg_ch, title=title)
+
+        bad_str = ";".join(bad_ch)
+        print(f"   → Seleccionados: {bad_str}")
+
+        rows.append(("sub-P01", ref, fif.name, bad_str))
+
+    if rows:
+        print(f"\nEscribiendo CSV → {OUTPUT_CSV}")
+        with OUTPUT_CSV.open("w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["subject", "ref", "file", "bad_channels"])
+            w.writerows(rows)
+        print("Hecho.")
+    else:
+        print("\nNo se seleccionaron canales malos → no se crea CSV.")
+
+# ============================================================
+if __name__ == "__main__":
+    esg_psd_click_inspection()
