@@ -1,0 +1,212 @@
+ # -*- coding: utf-8 -*-
+"""
+Created on Thu Dec 18 11:46:30 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Flag/remove time points with |ESG| > 100 µV.
+- If >50% of samples in a channel are flagged -> exclude channel.
+
+Outputs:
+- FIF copy with NaNs inserted (flagged samples) + bads marked
+- CSV summary per channel
+- TXT report per file with human-readable stats
+
+NOTE: This does NOT "filter" or "clean" in a signal-processing sense.
+It just removes (marks) high-amplitude samples as requested.
+"""
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import mne
+
+# ============================================================
+# CONFIG
+# ============================================================
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")
+SUBJECT_LABEL = "sub-P01"
+
+IN_DIR = SUBJECT_DIR / "esg_concat_filt"
+OUT_DIR = SUBJECT_DIR / "esg_concat_ampclean"
+OUT_DIR.mkdir(exist_ok=True)
+
+FILES = {
+    "TH6": IN_DIR / f"{SUBJECT_LABEL}_concat_ref-TH6_1k_notch48-53_bp5-400_raw.fif",
+    "AC":  IN_DIR / f"{SUBJECT_LABEL}_concat_ref-AC_1k_notch48-53_bp30-400_raw.fif",
+}
+
+ESG_CERV = [
+    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "SC6", "AC", "TH6"
+]
+
+# Do not apply the 100µV rule to reference channels
+REFERENCE_CHS = {"AC", "TH6"}  # set() if you want to include them too
+
+THRESH_UV = 100.0
+THRESH_V = THRESH_UV * 1e-6
+CHANNEL_EXCLUDE_FRACTION = 0.50
+
+DROP_EXCLUDED_CHANNELS = False  # keep but mark bads (recommended)
+
+SUMMARY_CSV = OUT_DIR / f"{SUBJECT_LABEL}_ampclean_100uV_summary.csv"
+
+# ============================================================
+def ampclean_one_file(raw: mne.io.BaseRaw, picks: list[str]):
+    """
+    Inserts NaNs for flagged samples per channel.
+    Marks channels with >50% flagged as bads.
+
+    Returns:
+      raw_out, per_channel_df, excluded_channels, global_stats
+    """
+    raw_out = raw.copy()
+
+    data = raw_out.get_data(picks=picks)  # (n_ch, n_times)
+    n_ch, n_t = data.shape
+
+    rows = []
+    excluded = []
+
+    total_flagged = 0
+
+    for i, ch in enumerate(picks):
+        x = data[i]
+        mask = np.abs(x) > THRESH_V
+        n_flag = int(mask.sum())
+        frac = float(n_flag / n_t)
+
+        total_flagged += n_flag
+
+        if frac > CHANNEL_EXCLUDE_FRACTION:
+            excluded.append(ch)
+            action = "EXCLUDE_CHANNEL"
+        else:
+            x2 = x.copy()
+            x2[mask] = np.nan
+            data[i] = x2
+            action = "REMOVE_TIMEPOINTS_NAN"
+
+        rows.append({
+            "channel": ch,
+            "fraction_flagged": frac,
+            "n_flagged": n_flag,
+            "n_total": int(n_t),
+            "action": action,
+        })
+
+    # write back
+    pick_idx = mne.pick_channels(raw_out.ch_names, include=picks)
+    raw_out._data[pick_idx, :] = data
+
+    # mark excluded channels
+    raw_out.info["bads"] = sorted(set(raw_out.info.get("bads", []) + excluded))
+
+    if DROP_EXCLUDED_CHANNELS and excluded:
+        raw_out.drop_channels(excluded)
+
+    df = pd.DataFrame(rows).sort_values("fraction_flagged", ascending=False)
+
+    # global stats (note: flagged points counted per-channel, not union across channels)
+    global_stats = {
+        "n_channels_checked": n_ch,
+        "n_times": n_t,
+        "total_flagged_points_across_channels": int(total_flagged),
+        "total_points_across_channels": int(n_ch * n_t),
+        "fraction_flagged_across_channels": float(total_flagged / (n_ch * n_t)),
+        "excluded_channels": excluded,
+    }
+
+    return raw_out, df, excluded, global_stats
+
+# ============================================================
+all_rows = []
+
+for ref, in_fif in FILES.items():
+    if not in_fif.exists():
+        print(f"[SKIP] Missing: {in_fif}")
+        continue
+
+    print("\n==============================================")
+    print(f"ref-{ref} | Loading: {in_fif.name}")
+    raw = mne.io.read_raw_fif(in_fif, preload=True, verbose="ERROR")
+
+    sfreq = float(raw.info["sfreq"])
+    dur_sec = raw.n_times / sfreq
+
+    picks = [ch for ch in ESG_CERV if ch in raw.ch_names and ch not in REFERENCE_CHS]
+    if not picks:
+        print("[SKIP] No ESG picks after excluding reference channels.")
+        continue
+
+    print(f"[INFO] Checking |x| > {THRESH_UV} µV on {len(picks)} ESG channels "
+          f"(refs excluded: {sorted(REFERENCE_CHS)})")
+
+    raw2, df_ch, excluded, g = ampclean_one_file(raw, picks)
+
+    out_fif = OUT_DIR / f"{SUBJECT_LABEL}_concat_ref-{ref}_ampclean100uV_raw.fif"
+    raw2.save(out_fif, overwrite=False)
+    print(f"[SAVED] {out_fif}")
+
+    # -------- Report to console --------
+    print(f"[REPORT] Duration: {dur_sec:.1f}s | sfreq: {sfreq:.0f} Hz | n_times: {raw.n_times}")
+    print(f"[REPORT] Flagged points (across channels): "
+          f"{g['total_flagged_points_across_channels']} / {g['total_points_across_channels']} "
+          f"= {100*g['fraction_flagged_across_channels']:.4f}%")
+    print(f"[REPORT] Excluded channels (>50% flagged): {excluded}")
+
+    top = df_ch.head(10)[["channel", "fraction_flagged", "n_flagged", "action"]]
+    print("[REPORT] Top channels by % flagged:")
+    for _, r in top.iterrows():
+        print(f"   - {r['channel']}: {100*r['fraction_flagged']:.4f}% "
+              f"({r['n_flagged']} samples) | {r['action']}")
+
+    # -------- Write per-file TXT report --------
+    report_txt = OUT_DIR / f"{SUBJECT_LABEL}_concat_ref-{ref}_ampclean100uV_report.txt"
+    with report_txt.open("w", encoding="utf-8") as f:
+        f.write(f"Subject: {SUBJECT_LABEL}\n")
+        f.write(f"Reference: {ref}\n")
+        f.write(f"Input file: {in_fif}\n")
+        f.write(f"Output file: {out_fif}\n\n")
+        f.write(f"sfreq: {sfreq:.3f} Hz\n")
+        f.write(f"n_times: {raw.n_times}\n")
+        f.write(f"duration_sec: {dur_sec:.3f}\n\n")
+        f.write(f"Threshold: |x| > {THRESH_UV} µV\n")
+        f.write(f"Channels checked: {len(picks)}\n")
+        f.write(f"Reference channels excluded from check: {sorted(REFERENCE_CHS)}\n\n")
+        f.write("GLOBAL (counted across channels, not union):\n")
+        f.write(f"  flagged_points: {g['total_flagged_points_across_channels']}\n")
+        f.write(f"  total_points:   {g['total_points_across_channels']}\n")
+        f.write(f"  fraction_flagged: {g['fraction_flagged_across_channels']:.8f}\n\n")
+        f.write(f"Excluded channels (>50% flagged): {excluded}\n\n")
+        f.write("Per-channel table (sorted by fraction_flagged desc):\n")
+        f.write(df_ch.to_string(index=False))
+        f.write("\n")
+
+    print(f"[REPORT SAVED] {report_txt}")
+
+    # collect rows for global CSV
+    for _, r in df_ch.iterrows():
+        all_rows.append({
+            "subject": SUBJECT_LABEL,
+            "ref": ref,
+            "file_in": in_fif.name,
+            "file_out": out_fif.name,
+            "channel": r["channel"],
+            "fraction_flagged": r["fraction_flagged"],
+            "n_flagged": r["n_flagged"],
+            "n_total": r["n_total"],
+            "action": r["action"],
+        })
+
+# -------- Combined CSV --------
+if all_rows:
+    pd.DataFrame(all_rows).to_csv(SUMMARY_CSV, index=False, encoding="utf-8")
+    print(f"\n[SUMMARY SAVED] {SUMMARY_CSV}")
+else:
+    print("\nNo outputs generated.")
