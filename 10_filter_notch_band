@@ -1,27 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-Created on Thu Dec 18 11:12:03 2025
+Created on Thu Dec 18 11:21:18 2025
 
 @author: navar
 """
 
 # -*- coding: utf-8 -*-
 """
-Filtering of concatenated files (1 kHz) with different band-pass per reference:
+Filtering of concatenated files (1 kHz) with different band-pass per reference
++ PSD computation for QC.
 
 TH6 ref:
-  - Notch: 48–53 Hz (zero-phase IIR, Butterworth 4th order)
-  - Band-pass: 5–400 Hz (zero-phase IIR, Butterworth 4th order)
+  - Notch: 48–53 Hz
+  - Band-pass: 5–400 Hz
 
 AC ref:
-  - Notch: 48–53 Hz (same)
-  - Band-pass: 30–400 Hz (zero-phase IIR, Butterworth 4th order)
+  - Notch: 48–53 Hz
+  - Band-pass: 30–400 Hz
 
-Does NOT overwrite originals; saves copies.
+Also computes and saves PSD plots (Welch).
 """
 
 from pathlib import Path
+import numpy as np
 import mne
+import matplotlib.pyplot as plt
 
 # ============================================================
 # CONFIG
@@ -31,12 +34,20 @@ SUBJECT_LABEL = "sub-P01"
 
 IN_DIR = SUBJECT_DIR / "esg_concat"
 OUT_DIR = SUBJECT_DIR / "esg_concat_filt"
-OUT_DIR.mkdir(exist_ok=True)
+PSD_DIR = OUT_DIR / "psd"
+PSD_DIR.mkdir(parents=True, exist_ok=True)
 
 FILES = {
     "TH6": IN_DIR / f"{SUBJECT_LABEL}_concat_ref-TH6_1k_raw.fif",
     "AC":  IN_DIR / f"{SUBJECT_LABEL}_concat_ref-AC_1k_raw.fif",
 }
+
+# ESG channels
+ESG_CERV = [
+    "Iz", "SC1", "S3", "S4", "S5", "S6", "S7", "S8", "S9",
+    "S11", "S12", "S13", "S14", "S15", "S16", "S17", "S18", "S19",
+    "SC6", "AC", "TH6"
+]
 
 # Notch specs
 NOTCH_LO = 48.0
@@ -44,7 +55,7 @@ NOTCH_HI = 53.0
 NOTCH_CENTER = (NOTCH_LO + NOTCH_HI) / 2.0
 NOTCH_WIDTH = (NOTCH_HI - NOTCH_LO)
 
-# Band-pass per file
+# Band-pass per ref
 BANDPASS = {
     "TH6": (5.0, 400.0),
     "AC":  (30.0, 400.0),
@@ -52,6 +63,11 @@ BANDPASS = {
 
 # IIR butterworth (4th order), zero-phase
 IIR_PARAMS = dict(order=4, ftype="butter")
+
+# PSD params
+PSD_FMIN = 1.0
+PSD_FMAX = 500.0
+PSD_NFFT = 4096
 
 # ============================================================
 # RUN
@@ -65,12 +81,17 @@ for ref, in_fif in FILES.items():
 
     print("\n==============================================")
     print(f"Reference: {ref}")
-    print(f"Input:  {in_fif.name}")
-    print(f"Notch:  {NOTCH_LO}-{NOTCH_HI} Hz | Band-pass: {l_freq}-{h_freq} Hz")
+    print(f"Input: {in_fif.name}")
+    print(f"Notch: {NOTCH_LO}-{NOTCH_HI} Hz | Band-pass: {l_freq}-{h_freq} Hz")
 
     raw = mne.io.read_raw_fif(in_fif, preload=True, verbose="ERROR")
 
-    # 1) Notch (48–53 Hz)
+    # Pick ESG channels for PSD
+    esg_chs = [ch for ch in ESG_CERV if ch in raw.ch_names]
+
+    # -------------------
+    # 1) Notch
+    # -------------------
     raw.notch_filter(
         freqs=[NOTCH_CENTER],
         notch_widths=NOTCH_WIDTH,
@@ -80,7 +101,9 @@ for ref, in_fif in FILES.items():
         verbose="ERROR",
     )
 
+    # -------------------
     # 2) Band-pass
+    # -------------------
     raw.filter(
         l_freq=l_freq,
         h_freq=h_freq,
@@ -90,7 +113,9 @@ for ref, in_fif in FILES.items():
         verbose="ERROR",
     )
 
-    # Save
+    # -------------------
+    # 3) SAVE FILTERED RAW
+    # -------------------
     out_fif = OUT_DIR / f"{SUBJECT_LABEL}_concat_ref-{ref}_1k_notch48-53_bp{int(l_freq)}-{int(h_freq)}_raw.fif"
     raw.save(out_fif, overwrite=False)
     print(f"[SAVED] {out_fif}")
