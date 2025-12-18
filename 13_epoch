@@ -1,0 +1,150 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec 18 11:48:03 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Epoch ESG around stimulus and baseline-correct.
+
+Third:
+- Epochs: -200 ms to 700 ms around stimulus
+- Baseline: -110 ms to -10 ms
+
+Runs on the concatenated, filtered, amplitude-cleaned raw files (ref-TH6 and ref-AC).
+Saves Epochs to FIF and a CSV summary of epoch counts per event type.
+"""
+
+from pathlib import Path
+import numpy as np
+import pandas as pd
+import mne
+
+# ============================================================
+# CONFIG
+# ============================================================
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")
+SUBJECT_LABEL = "sub-P01"
+
+IN_DIR = SUBJECT_DIR / "esg_concat_ampclean"  # output of your 100 µV step
+OUT_DIR = SUBJECT_DIR / "esg_epochs"
+OUT_DIR.mkdir(exist_ok=True)
+
+FILES = {
+    "TH6": IN_DIR / f"{SUBJECT_LABEL}_concat_ref-TH6_ampclean100uV_raw.fif",
+    "AC":  IN_DIR / f"{SUBJECT_LABEL}_concat_ref-AC_ampclean100uV_raw.fif",
+}
+
+# Epoching parameters
+TMIN = -0.200
+TMAX = 0.700
+BASELINE = (-0.110, -0.010)
+
+# If you want to restrict to certain triggers, list them here (as strings in annotation descriptions).
+# If empty -> take all stimulus-like annotations.
+ONLY_STIM_DESCRIPTIONS = []  # e.g. ["Stimulus/1", "Stimulus/2"]
+
+# How strict about rejecting NaNs:
+REJECT_NAN_EPOCHS = True  # True: drop epochs containing NaN (from your >100µV removal)
+
+SUMMARY_CSV = OUT_DIR / f"{SUBJECT_LABEL}_epochs_summary.csv"
+
+# ============================================================
+def pick_stim_annotations(raw: mne.io.BaseRaw):
+    """Return unique annotation descriptions that look like stimulus markers."""
+    desc = np.array(raw.annotations.description, dtype=str)
+    # common BrainVision patterns: "Stimulus/S  1", "S  1", "Stimulus/1", etc.
+    stim_mask = np.array(
+        [("stimulus" in d.lower()) or d.strip().startswith("S") for d in desc],
+        dtype=bool
+    )
+    stim_desc = sorted(set(desc[stim_mask].tolist()))
+    return stim_desc
+
+def build_event_id(stim_desc):
+    """Map descriptions -> integer event codes for mne.events_from_annotations."""
+    # mne can auto-map, but we want stable names; keep description as key
+    return {d: i + 1 for i, d in enumerate(stim_desc)}
+
+# ============================================================
+all_rows = []
+
+for ref, fif in FILES.items():
+    if not fif.exists():
+        print(f"[SKIP] Missing: {fif}")
+        continue
+
+    print("\n==============================================")
+    print(f"ref-{ref} | Loading: {fif.name}")
+    raw = mne.io.read_raw_fif(fif, preload=True, verbose="ERROR")
+
+    if len(raw.annotations) == 0:
+        raise RuntimeError(f"No annotations found in {fif.name}. Cannot epoch around stimulus.")
+
+    stim_desc = pick_stim_annotations(raw)
+    if ONLY_STIM_DESCRIPTIONS:
+        stim_desc = [d for d in stim_desc if d in ONLY_STIM_DESCRIPTIONS]
+
+    if not stim_desc:
+        raise RuntimeError(f"No stimulus-like annotations found in {fif.name}.")
+
+    event_id = build_event_id(stim_desc)
+
+    # Build events from annotations
+    events, event_id_used = mne.events_from_annotations(
+        raw,
+        event_id=event_id,
+        verbose="ERROR",
+    )
+
+    print(f"[INFO] Found {len(events)} events across {len(event_id_used)} types")
+
+    # Create epochs
+    epochs = mne.Epochs(
+        raw,
+        events=events,
+        event_id=event_id_used,
+        tmin=TMIN,
+        tmax=TMAX,
+        baseline=BASELINE,
+        preload=True,
+        detrend=None,
+        reject_by_annotation=True,   # will respect BAD_* annotations if present
+        verbose="ERROR",
+    )
+
+    # Drop NaN epochs if desired
+    if REJECT_NAN_EPOCHS:
+        data = epochs.get_data()  # (n_epochs, n_ch, n_times)
+        bad_ep = np.any(~np.isfinite(data), axis=(1, 2))
+        n_bad = int(bad_ep.sum())
+        if n_bad > 0:
+            epochs = epochs.drop(np.where(bad_ep)[0], reason="contains_NaN")
+        print(f"[INFO] Dropped {n_bad} epochs containing NaNs")
+
+    # Save epochs
+    out_epo = OUT_DIR / f"{SUBJECT_LABEL}_ref-{ref}_epo.fif"
+    epochs.save(out_epo, overwrite=False)
+    print(f"[SAVED] {out_epo}")
+
+    # Summary counts per event type
+    counts = {k: 0 for k in epochs.event_id.keys()}
+    for k in counts:
+        counts[k] = int(np.sum(epochs.events[:, 2] == epochs.event_id[k]))
+
+    for desc, n in counts.items():
+        all_rows.append({
+            "subject": SUBJECT_LABEL,
+            "ref": ref,
+            "event_description": desc,
+            "n_epochs": n,
+        })
+
+# Write combined summary CSV
+if all_rows:
+    pd.DataFrame(all_rows).to_csv(SUMMARY_CSV, index=False, encoding="utf-8")
+    print(f"\n[SUMMARY SAVED] {SUMMARY_CSV}")
+else:
+    print("\nNo epochs were created.")
