@@ -1,0 +1,98 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec 18 11:12:03 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Filtering of concatenated files (1 kHz) with different band-pass per reference:
+
+TH6 ref:
+  - Notch: 48–53 Hz (zero-phase IIR, Butterworth 4th order)
+  - Band-pass: 5–400 Hz (zero-phase IIR, Butterworth 4th order)
+
+AC ref:
+  - Notch: 48–53 Hz (same)
+  - Band-pass: 30–400 Hz (zero-phase IIR, Butterworth 4th order)
+
+Does NOT overwrite originals; saves copies.
+"""
+
+from pathlib import Path
+import mne
+
+# ============================================================
+# CONFIG
+# ============================================================
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")
+SUBJECT_LABEL = "sub-P01"
+
+IN_DIR = SUBJECT_DIR / "esg_concat"
+OUT_DIR = SUBJECT_DIR / "esg_concat_filt"
+OUT_DIR.mkdir(exist_ok=True)
+
+FILES = {
+    "TH6": IN_DIR / f"{SUBJECT_LABEL}_concat_ref-TH6_1k_raw.fif",
+    "AC":  IN_DIR / f"{SUBJECT_LABEL}_concat_ref-AC_1k_raw.fif",
+}
+
+# Notch specs
+NOTCH_LO = 48.0
+NOTCH_HI = 53.0
+NOTCH_CENTER = (NOTCH_LO + NOTCH_HI) / 2.0
+NOTCH_WIDTH = (NOTCH_HI - NOTCH_LO)
+
+# Band-pass per file
+BANDPASS = {
+    "TH6": (5.0, 400.0),
+    "AC":  (30.0, 400.0),
+}
+
+# IIR butterworth (4th order), zero-phase
+IIR_PARAMS = dict(order=4, ftype="butter")
+
+# ============================================================
+# RUN
+# ============================================================
+for ref, in_fif in FILES.items():
+    if not in_fif.exists():
+        print(f"[SKIP] Missing: {in_fif}")
+        continue
+
+    l_freq, h_freq = BANDPASS[ref]
+
+    print("\n==============================================")
+    print(f"Reference: {ref}")
+    print(f"Input:  {in_fif.name}")
+    print(f"Notch:  {NOTCH_LO}-{NOTCH_HI} Hz | Band-pass: {l_freq}-{h_freq} Hz")
+
+    raw = mne.io.read_raw_fif(in_fif, preload=True, verbose="ERROR")
+
+    # 1) Notch (48–53 Hz)
+    raw.notch_filter(
+        freqs=[NOTCH_CENTER],
+        notch_widths=NOTCH_WIDTH,
+        method="iir",
+        iir_params=IIR_PARAMS,
+        phase="zero",
+        verbose="ERROR",
+    )
+
+    # 2) Band-pass
+    raw.filter(
+        l_freq=l_freq,
+        h_freq=h_freq,
+        method="iir",
+        iir_params=IIR_PARAMS,
+        phase="zero",
+        verbose="ERROR",
+    )
+
+    # Save
+    out_fif = OUT_DIR / f"{SUBJECT_LABEL}_concat_ref-{ref}_1k_notch48-53_bp{int(l_freq)}-{int(h_freq)}_raw.fif"
+    raw.save(out_fif, overwrite=False)
+    print(f"[SAVED] {out_fif}")
+
+print("\nDONE.")
