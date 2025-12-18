@@ -1,0 +1,134 @@
+
+
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec 18 12:41:42 2025
+
+@author: navar
+"""
+
+# -*- coding: utf-8 -*-
+"""
+Compare ERPs in channel SC6, but now by GROUPS:
+
+Groups:
+  - Deviant        = Stimulus/S 41 + Stimulus/S 25
+  - Early Standard = Stimulus/S 35 + Stimulus/S 19
+  - Late Standard  = Stimulus/S 39 + Stimulus/S 23
+
+For each reference (TH6, AC), plot:
+  1) Group ERPs with 95% CI
+  2) Difference waves (Deviant - Early) and (Deviant - Late)
+"""
+
+from pathlib import Path
+import mne
+
+# =========================
+# PATHS
+# =========================
+SUBJECT_DIR = Path(r"C:\Users\navar\Desktop\sub-P01\sub-P01")
+EPO_DIR = SUBJECT_DIR / "esg_epochs"
+
+EPO_FILES = {
+    "TH6": EPO_DIR / "sub-P01_ref-TH6_epo.fif",
+    "AC":  EPO_DIR / "sub-P01_ref-AC_epo.fif",
+}
+
+# =========================
+# SETTINGS
+# =========================
+CH = "Iz"
+
+DEVIANTS = ["Stimulus/S 41", "Stimulus/S 25"]
+EARLY_STANDARDS = ["Stimulus/S 35", "Stimulus/S 19"]
+LATE_STANDARDS = ["Stimulus/S 39", "Stimulus/S 23"]
+
+COLOR_MAP = {
+    "Deviant": "crimson",
+    "Early Standard": "royalblue",
+    "Late Standard": "seagreen",
+    "Standard": "black",
+    "DIFF (Dev-Early)": "black",
+    "DIFF (Dev-Late)": "gray",
+}
+
+def require_event(epochs: mne.Epochs, ev: str, ref: str):
+    if ev not in epochs.event_id:
+        raise RuntimeError(
+            f"[{ref}] Event '{ev}' not found. Available examples: {list(epochs.event_id.keys())[:20]}"
+        )
+
+def combine_epochs(ep: mne.Epochs, events: list[str], ref: str, label: str) -> mne.Epochs:
+    for ev in events:
+        require_event(ep, ev, ref)
+    parts = [ep[ev] for ev in events]
+    combined = mne.concatenate_epochs(parts)
+    print(f"[{ref}] {CH} | {label}: n={len(combined)}  (from {events})")
+    return combined
+
+def plot_groups(ep: mne.Epochs, ref: str):
+    ep = ep.copy().pick(CH)
+
+    # --- Build grouped Epochs (so CI=0.95 is computed from trials)
+    ep_dev   = combine_epochs(ep, DEVIANTS, ref, "Deviant")
+    ep_early = combine_epochs(ep, EARLY_STANDARDS, ref, "Early Standard")
+    ep_late  = combine_epochs(ep, LATE_STANDARDS, ref, "Late Standard")
+
+    # --- 1) Group ERPs with 95% CI
+    evokeds_for_plot = {
+        "Deviant": ep_dev.average(),
+        "Early Standard": ep_early.average(),
+        "Late Standard": ep_late.average(),
+    }
+    colors_used = {k: COLOR_MAP[k] for k in evokeds_for_plot.keys() if k in COLOR_MAP}
+
+    mne.viz.plot_compare_evokeds(
+        evokeds_for_plot,          # passing Epochs => MNE plots their average + CI from trials
+        picks=CH,
+        ci=0.95,
+        colors=colors_used,
+        title=f"{ref} | {CH} | Deviant (41+25) vs Early (35+19) vs Late (39+23)",
+        show=True,
+    )
+
+    # --- 2) Difference waves (using the group averages)
+    evo_dev = ep_dev.average()
+    evo_early = ep_early.average()
+    evo_late = ep_late.average()
+
+    diff_dev_early = mne.combine_evoked([evo_dev, evo_early], weights=[1, -1])
+    diff_dev_late  = mne.combine_evoked([evo_dev, evo_late],  weights=[1, -1])
+
+    # (CI for these DIFF curves is not computed from trials here; we plot the curves only)
+    mne.viz.plot_compare_evokeds(
+        {"DIFF (Dev-Early)": diff_dev_early},
+        picks=CH,
+        ci=None,
+        colors={"DIFF (Dev-Early)": COLOR_MAP["DIFF (Dev-Early)"]},
+        title=f"{ref} | {CH} | DIFF = Deviant(41+25) - Early(35+19)",
+        show=True,
+    )
+
+    mne.viz.plot_compare_evokeds(
+        {"DIFF (Dev-Late)": diff_dev_late},
+        picks=CH,
+        ci=None,
+        colors={"DIFF (Dev-Late)": COLOR_MAP["DIFF (Dev-Late)"]},
+        title=f"{ref} | {CH} | DIFF = Deviant(41+25) - Late(39+23)",
+        show=True,
+    )
+
+# =========================
+# RUN
+# =========================
+for ref, path in EPO_FILES.items():
+    epochs = mne.read_epochs(path, preload=True, verbose="ERROR")
+
+    if CH not in epochs.ch_names:
+        raise RuntimeError(f"[ref-{ref}] Channel {CH} not in epochs. Available: {epochs.ch_names}")
+
+    print("\n==============================================")
+    print(f"ref-{ref} | {path.name}")
+
+    plot_groups(epochs, ref=f"ref-{ref}")
