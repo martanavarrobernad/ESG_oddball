@@ -1,0 +1,302 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Fri Jan  2 14:00:01 2026
+
+@author: navar
+"""
+
+import numpy as np
+import mne
+import matplotlib.pyplot as plt
+
+from sklearn.cross_decomposition import CCA
+from sklearn.preprocessing import StandardScaler
+
+
+# -------------------------
+# CONFIG
+# -------------------------
+EEG_PATH = r"C:\Users\navar\Desktop\sub-P01\sub-P01\eeg_step5_epochs\eeg_epo.fif"
+ESG_PATH = r"C:\Users\navar\Desktop\sub-P01\sub-P01\esg_epochs\sub-P01_ref-AC_epo.fif"  # ventral
+
+EEG_CHANNELS = [
+    "Fp1","Fz","F3","F7","FT9","FC5","FC1","C3","T7","TP9",
+    "CP5","CP1","Pz","P3","P7","O1","Oz","O2","P4","P8",
+    "TP10","CP6","CP2","C4","T8","FT10","FC6","FC2","F4","F8",
+    "Fp2","AF7","AF3","AFz","F1","F5","FT7","FC3","C1","C5",
+    "TP7","CP3","P1","P5","PO7","PO3","POz","PO4","PO8","P6",
+    "P2","CPz","CP4","TP8","C6","C2","FC4","FT8","F6","AF8",
+    "AF4","F2"
+]
+
+ESG_CERV = [
+    "Iz","SC1","SC6","S3","S4","S5","S6","S7","S8","S9",
+    "S11","S12","S13","S14","S15","S16","S17","S18","S19",
+    "AC","TH6"
+]
+
+# Condiciones (según tus códigos)
+DEV_CODES   = [41, 25]
+EARLY_CODES = [35, 19]
+LATE_CODES  = [39, 23]
+
+# Ventanas típicas (ajusta si quieres)
+MMN_WIN = (0.10, 0.25)   # 100–250 ms
+P3B_WIN = (0.30, 0.60)   # 300–600 ms
+
+
+# -------------------------
+# HELPERS
+# -------------------------
+def safe_pick_channels(epochs: mne.Epochs, ch_names):
+    """Pick channels robustly; error claro si no encuentra nada."""
+    present = [ch for ch in ch_names if ch in epochs.ch_names]
+    if len(present) == 0:
+        raise ValueError(
+            "No se encontró ningún canal de los que pediste en este archivo.\n"
+            f"Canales pedidos (ejemplo): {ch_names[:5]} ...\n"
+            f"Canales disponibles (ejemplo): {epochs.ch_names[:20]} ..."
+        )
+    return epochs.copy().pick_channels(present, ordered=True)
+
+def align_times(eeg: mne.Epochs, esg: mne.Epochs):
+    """Alinea sfreq y times: resample al menor sfreq y crop a intersección."""
+    eeg = eeg.copy()
+    esg = esg.copy()
+
+    sf_eeg = float(eeg.info["sfreq"])
+    sf_esg = float(esg.info["sfreq"])
+    target = min(sf_eeg, sf_esg)
+
+    if abs(sf_eeg - target) > 1e-6:
+        eeg.resample(target, npad="auto")
+    if abs(sf_esg - target) > 1e-6:
+        esg.resample(target, npad="auto")
+
+    # crop a intersección
+    tmin = max(float(eeg.times[0]), float(esg.times[0]))
+    tmax = min(float(eeg.times[-1]), float(esg.times[-1]))
+    eeg.crop(tmin=tmin, tmax=tmax)
+    esg.crop(tmin=tmin, tmax=tmax)
+
+    # chequeo final
+    if len(eeg.times) != len(esg.times) or np.max(np.abs(eeg.times - esg.times)) > 1e-12:
+        raise RuntimeError("EEG y ESG no tienen el mismo eje temporal (times) tras align. Revisa sfreq/crop.")
+    return eeg, esg
+
+def match_epochs_by_events(eeg: mne.Epochs, esg: mne.Epochs):
+    """
+    Empareja epochs entre EEG y ESG usando (event_sample, event_id).
+    Esto arregla el típico 3000 vs 2983 por rechazos distintos.
+    """
+    eeg = eeg.copy()
+    esg = esg.copy()
+
+    eeg_events = eeg.events[:, [0, 2]]
+    esg_events = esg.events[:, [0, 2]]
+
+    # convertir a "keys" comparables
+    eeg_keys = eeg_events[:, 0].astype(np.int64) * 100000 + eeg_events[:, 1].astype(np.int64)
+    esg_keys = esg_events[:, 0].astype(np.int64) * 100000 + esg_events[:, 1].astype(np.int64)
+
+    common_keys = np.intersect1d(eeg_keys, esg_keys, assume_unique=False)
+    if common_keys.size < 2:
+        raise ValueError(
+            f"Intersección de eventos demasiado pequeña: {common_keys.size}.\n"
+            "Puede que EEG y ESG no vengan del mismo set de eventos o se haya modificado el sample."
+        )
+
+    eeg_idx = np.nonzero(np.isin(eeg_keys, common_keys))[0]
+    esg_idx = np.nonzero(np.isin(esg_keys, common_keys))[0]
+
+    eeg = eeg[eeg_idx]
+    esg = esg[esg_idx]
+
+    # ordenar ambos en el mismo orden de keys
+    eeg_keys2 = (eeg.events[:, 0].astype(np.int64) * 100000 + eeg.events[:, 2].astype(np.int64))
+    esg_keys2 = (esg.events[:, 0].astype(np.int64) * 100000 + esg.events[:, 2].astype(np.int64))
+
+    order = np.argsort(common_keys)
+    common_sorted = common_keys[order]
+
+    def reorder_to_common(ep, keys):
+        idx_map = {k: i for i, k in enumerate(keys)}
+        new_idx = [idx_map[k] for k in common_sorted if k in idx_map]
+        return ep[new_idx]
+
+    eeg = reorder_to_common(eeg, eeg_keys2)
+    esg = reorder_to_common(esg, esg_keys2)
+
+    if len(eeg) != len(esg):
+        raise RuntimeError(f"Tras match aún difieren: EEG={len(eeg)} ESG={len(esg)}")
+    return eeg, esg
+
+def pick_by_code(epochs: mne.Epochs, codes):
+    """
+    Selecciona epochs por códigos numéricos (p.ej. Stimulus/S 41).
+    Funciona tanto si event_id tiene 'Stimulus/S 41' como si solo es 41.
+    """
+    # Mapeo disponible
+    ev = epochs.event_id  # dict: name -> int
+    picked_names = []
+    for name, val in ev.items():
+        for c in codes:
+            if val == c:
+                picked_names.append(name)
+            elif str(c) in name:  # por si viene como 'Stimulus/S 41'
+                # ojo: podría pillar '141' también; si te pasa, quita este elif
+                picked_names.append(name)
+
+    picked_names = sorted(set(picked_names))
+    if len(picked_names) == 0:
+        # debug útil
+        some = list(epochs.event_id.items())[:25]
+        raise ValueError(
+            f"No encuentro eventos para codes={codes}.\n"
+            f"Ejemplos de event_id disponibles: {some}"
+        )
+    return mne.concatenate_epochs([epochs[name] for name in picked_names])
+
+def stack_epochs_time(epochs: mne.Epochs):
+    """Devuelve array (n_epochs*n_times, n_channels)."""
+    data = epochs.get_data()  # (E, C, T)
+    E, C, T = data.shape
+    # (E, T, C) -> (E*T, C)
+    X = np.transpose(data, (0, 2, 1)).reshape(E * T, C).astype(np.float64, copy=False)
+    return X
+
+def apply_spatial_filter_to_evoked(evoked: mne.Evoked, scaler: StandardScaler, w: np.ndarray):
+    """
+    Evoked.data: (C, T)
+    scaler: ajustado sobre los datos apilados de training (por canal)
+    w: (C,) o (C,1)
+    """
+    W = w.reshape(-1)
+    X = evoked.data.T  # (T, C)
+    Xs = (X - scaler.mean_) / scaler.scale_
+    comp = Xs @ W  # (T,)
+    return comp
+
+
+# -------------------------
+# MAIN
+# -------------------------
+# 1) Cargar
+eeg = mne.read_epochs(EEG_PATH, preload=True, verbose="error")
+esg = mne.read_epochs(ESG_PATH, preload=True, verbose="error")
+
+# 2) Picks (evita "picks yielded no channels")
+eeg = safe_pick_channels(eeg, EEG_CHANNELS)
+esg = safe_pick_channels(esg, ESG_CERV)
+
+# 3) Alinear tiempos (evita "times mismatch")
+eeg, esg = align_times(eeg, esg)
+
+# 4) Match epochs (evita "3000 vs 2983")
+eeg, esg = match_epochs_by_events(eeg, esg)
+
+print(f"OK: aligned & matched. n_epochs={len(eeg)}  n_times={len(eeg.times)}  sfreq={eeg.info['sfreq']}")
+
+# 5) Crear condiciones
+dev_eeg   = pick_by_code(eeg, DEV_CODES)
+early_eeg = pick_by_code(eeg, EARLY_CODES)
+late_eeg  = pick_by_code(eeg, LATE_CODES)
+
+dev_esg   = pick_by_code(esg, DEV_CODES)
+early_esg = pick_by_code(esg, EARLY_CODES)
+late_esg  = pick_by_code(esg, LATE_CODES)
+
+print("Epochs por condición (EEG):", len(dev_eeg), len(early_eeg), len(late_eeg))
+print("Epochs por condición (ESG):", len(dev_esg), len(early_esg), len(late_esg))
+
+# Si alguna condición queda 0, salta aquí con error claro antes de CCA
+if min(len(dev_eeg), len(late_eeg), len(dev_esg), len(late_esg)) < 2:
+    raise ValueError("Alguna condición tiene <2 epochs tras selección. Revisa event_id/códigos.")
+
+# 6) Entrenar CCA (spatial) usando SOLO los trials relevantes (por ejemplo dev+late)
+train_eeg = mne.concatenate_epochs([dev_eeg, late_eeg])
+train_esg = mne.concatenate_epochs([dev_esg, late_esg])
+
+X = stack_epochs_time(train_eeg)  # (obs, EEG_ch)
+Y = stack_epochs_time(train_esg)  # (obs, ESG_ch)
+
+# Escalado por canal (MUY importante)
+sx = StandardScaler(with_mean=True, with_std=True)
+sy = StandardScaler(with_mean=True, with_std=True)
+Xs = sx.fit_transform(X)
+Ys = sy.fit_transform(Y)
+
+cca = CCA(n_components=1, max_iter=2000)
+cca.fit(Xs, Ys)
+
+wx = cca.x_weights_[:, 0]  # (EEG_ch,)
+wy = cca.y_weights_[:, 0]  # (ESG_ch,)
+
+# correlación canónica aproximada en training
+U, V = cca.transform(Xs, Ys)
+corr = np.corrcoef(U[:, 0], V[:, 0])[0, 1]
+print(f"Canonical corr (comp1, training): r={corr:.3f}")
+
+# 7) Proyectar evoked de cada condición en comp1 (EEG y ESG)
+t = eeg.times * 1000.0  # ms
+
+ev_dev_eeg   = dev_eeg.average()
+ev_late_eeg  = late_eeg.average()
+ev_early_eeg = early_eeg.average()
+
+ev_dev_esg   = dev_esg.average()
+ev_late_esg  = late_esg.average()
+ev_early_esg = early_esg.average()
+
+comp_dev_eeg   = apply_spatial_filter_to_evoked(ev_dev_eeg, sx, wx)
+comp_late_eeg  = apply_spatial_filter_to_evoked(ev_late_eeg, sx, wx)
+comp_early_eeg = apply_spatial_filter_to_evoked(ev_early_eeg, sx, wx)
+
+comp_dev_esg   = apply_spatial_filter_to_evoked(ev_dev_esg, sy, wy)
+comp_late_esg  = apply_spatial_filter_to_evoked(ev_late_esg, sy, wy)
+comp_early_esg = apply_spatial_filter_to_evoked(ev_early_esg, sy, wy)
+
+# 8) Diferencias (lo que tú quieres ver)
+mmn_eeg = comp_dev_eeg - comp_late_eeg
+p3b_eeg = comp_dev_eeg - comp_late_eeg  # mismo contraste; la ventana es lo que cambia
+
+mmn_esg = comp_dev_esg - comp_late_esg
+p3b_esg = comp_dev_esg - comp_late_esg
+
+# 9) Plot
+def shade(ax, win_s, label):
+    a, b = win_s
+    ax.axvspan(a*1000, b*1000, alpha=0.15)
+    ax.text((a+b)*500, ax.get_ylim()[1]*0.9, label, ha="center", va="top")
+
+fig, axes = plt.subplots(2, 2, figsize=(12, 7), sharex=True)
+axes = axes.ravel()
+
+# EEG MMN/P3b
+axes[0].plot(t, mmn_eeg)
+axes[0].axvline(0, linestyle="--")
+axes[0].set_title("EEG CCA comp1: Deviant - LateStd (MMN window)")
+shade(axes[0], MMN_WIN, "MMN")
+
+axes[1].plot(t, p3b_eeg)
+axes[1].axvline(0, linestyle="--")
+axes[1].set_title("EEG CCA comp1: Deviant - LateStd (P3b window)")
+shade(axes[1], P3B_WIN, "P3b")
+
+# ESG MMN/P3b
+axes[2].plot(t, mmn_esg)
+axes[2].axvline(0, linestyle="--")
+axes[2].set_title("ESG (ventral AC) CCA comp1: Deviant - LateStd (MMN window)")
+shade(axes[2], MMN_WIN, "MMN")
+
+axes[3].plot(t, p3b_esg)
+axes[3].axvline(0, linestyle="--")
+axes[3].set_title("ESG (ventral AC) CCA comp1: Deviant - LateStd (P3b window)")
+shade(axes[3], P3B_WIN, "P3b")
+
+for ax in axes:
+    ax.set_xlabel("Time (ms)")
+    ax.set_ylabel("a.u.")
+
+plt.tight_layout()
+plt.show()
